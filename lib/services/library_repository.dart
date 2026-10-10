@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -81,6 +82,42 @@ class LibraryRepository {
     return addedTracks;
   }
 
+  /// Moves an already-downloaded file into the library `music` folder and
+  /// registers it, overriding any metadata that may be missing from the file
+  /// itself (YouTube audio is frequently untagged).
+  Future<Track> registerDownloadedTrack({
+    required String filePath,
+    required String title,
+    required String artist,
+    required String album,
+    required Duration? duration,
+    Uint8List? fallbackArtwork,
+  }) async {
+    final savedPaths =
+        await _preferences.getStringList(_trackPathsKey) ?? <String>[];
+    final copyPath = await _moveInto(filePath, 'music');
+    final track = Track(
+      path: copyPath,
+      title: title,
+      artist: artist,
+      album: album,
+      duration: duration,
+      artworkBytes: await _readArtwork(copyPath) ?? fallbackArtwork,
+    );
+    savedPaths.add(copyPath);
+    await _preferences.setStringList(_trackPathsKey, savedPaths);
+    return track;
+  }
+
+  Future<Uint8List?> _readArtwork(String path) async {
+    try {
+      final loaded = await loadTrack(path);
+      return loaded.artworkBytes;
+    } catch (_) {
+      return null;
+    }
+  }
+
   Future<String> importPlaylistCover(String sourcePath) =>
       _copyInto(sourcePath, 'playlist_covers');
 
@@ -115,21 +152,48 @@ class LibraryRepository {
           'Selected file is no longer available', sourcePath);
     }
 
-    final supportDirectory = await _supportDirectoryProvider();
-    final targetDirectory =
-        Directory(p.join(supportDirectory.path, subdirectory));
-    await targetDirectory.create(recursive: true);
-
-    final fileName = p.basename(sourcePath);
-    final extension = p.extension(fileName);
-    final name = p.basenameWithoutExtension(fileName);
-    var copyPath = p.join(targetDirectory.path, fileName);
-    var suffix = 1;
-    while (await File(copyPath).exists()) {
-      copyPath = p.join(targetDirectory.path, '$name ($suffix)$extension');
-      suffix++;
-    }
+    final targetDirectory = await _subdirectory(subdirectory);
+    final copyPath = _uniquePath(targetDirectory, p.basename(sourcePath));
     await source.copy(copyPath);
     return copyPath;
+  }
+
+  Future<String> _moveInto(String sourcePath, String subdirectory) async {
+    final source = File(sourcePath);
+    if (!await source.exists()) {
+      throw FileSystemException('Downloaded file is missing', sourcePath);
+    }
+    final targetDirectory = await _subdirectory(subdirectory);
+    final targetPath = _uniquePath(targetDirectory, p.basename(sourcePath));
+    if (p.equals(source.path, targetPath)) return source.path;
+    try {
+      return (await source.rename(targetPath)).path;
+    } on FileSystemException {
+      // Fall back to copy + delete when rename crosses volumes.
+      await source.copy(targetPath);
+      try {
+        await source.delete();
+      } catch (_) {}
+      return targetPath;
+    }
+  }
+
+  Future<Directory> _subdirectory(String name) async {
+    final supportDirectory = await _supportDirectoryProvider();
+    final directory = Directory(p.join(supportDirectory.path, name));
+    await directory.create(recursive: true);
+    return directory;
+  }
+
+  static String _uniquePath(Directory directory, String fileName) {
+    final extension = p.extension(fileName);
+    final name = p.basenameWithoutExtension(fileName);
+    var candidate = p.join(directory.path, fileName);
+    var suffix = 1;
+    while (File(candidate).existsSync()) {
+      candidate = p.join(directory.path, '$name ($suffix)$extension');
+      suffix++;
+    }
+    return candidate;
   }
 }

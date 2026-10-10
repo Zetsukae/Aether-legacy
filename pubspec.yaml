@@ -37,6 +37,8 @@ flutter:
   assets:
     - assets/icon/app_icon.png
     - assets/icon/app_mark.svg
+    - assets/tools/yt-dlp.exe
+    - assets/tools/yt-dlp_linux
 
 flutter_launcher_icons:
   android: true

@@ -9,12 +9,15 @@ import 'package:flutter_svg/flutter_svg.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
 import 'package:just_audio_media_kit/just_audio_media_kit.dart';
+import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'models/playlist.dart';
 import 'models/track.dart';
 import 'services/library_repository.dart';
+import 'services/youtube_service.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -51,6 +54,7 @@ class _AetherAppState extends State<AetherApp> {
   ThemeMode _themeMode = ThemeMode.system;
   int _accentIndex = 0;
   bool _useSystemColors = true;
+  bool _youTubeSearch = false;
 
   @override
   void initState() {
@@ -65,8 +69,12 @@ class _AetherAppState extends State<AetherApp> {
       final useSystemColors = await _preferences.getBool(
         'appearance.useSystemColors',
       );
+      final youTubeSearch = await _preferences.getBool(
+        'about.experimentalYoutube',
+      );
       if (!mounted) return;
       setState(() {
+        _youTubeSearch = youTubeSearch ?? false;
         _themeMode = ThemeMode.values.firstWhere(
           (value) => value.name == mode,
           orElse: () => ThemeMode.system,
@@ -92,6 +100,11 @@ class _AetherAppState extends State<AetherApp> {
   void _setUseSystemColors(bool value) {
     setState(() => _useSystemColors = value);
     unawaited(_preferences.setBool('appearance.useSystemColors', value));
+  }
+
+  void _setYouTubeSearch(bool value) {
+    setState(() => _youTubeSearch = value);
+    unawaited(_preferences.setBool('about.experimentalYoutube', value));
   }
 
   void _showAppearance(BuildContext context, bool supportsSystemColors) {
@@ -137,10 +150,12 @@ class _AetherAppState extends State<AetherApp> {
             useMaterial3: true,
           ),
           home: PlayerHome(
+            youTubeSearchEnabled: _youTubeSearch,
             onOpenAppearance: (context) => _showAppearance(
               context,
               lightDynamic != null && darkDynamic != null,
             ),
+            onYouTubeSearchChanged: _setYouTubeSearch,
           ),
         );
       },
@@ -318,9 +333,16 @@ class _AccentSwatch extends StatelessWidget {
 }
 
 class PlayerHome extends StatefulWidget {
-  const PlayerHome({super.key, required this.onOpenAppearance});
+  const PlayerHome({
+    super.key,
+    required this.onOpenAppearance,
+    required this.youTubeSearchEnabled,
+    required this.onYouTubeSearchChanged,
+  });
 
   final ValueChanged<BuildContext> onOpenAppearance;
+  final bool youTubeSearchEnabled;
+  final ValueChanged<bool> onYouTubeSearchChanged;
 
   @override
   State<PlayerHome> createState() => _PlayerHomeState();
@@ -349,7 +371,24 @@ class _PlayerHomeState extends State<PlayerHome> {
   StreamSubscription<PlayerState>? _playerStateSubscription;
   StreamSubscription<Duration?>? _durationSubscription;
 
-  Track? get _playing => _currentTrack == null ? null : _tracks[_currentTrack!];
+  final YouTubeService _youTubeService = YouTubeService();
+  bool _youTubeMode = false;
+  bool _remotePlayback = false;
+  bool _youTubeLoading = false;
+  String? _youTubePlayingId;
+  final Set<String> _downloadingVideoIds = <String>{};
+  final Map<String, double> _downloadProgress = <String, double>{};
+  String? _youTubeError;
+  bool _youTubeRateLimited = false;
+  List<YouTubeSearchResult> _youTubeResults = const [];
+
+  Track? get _playing {
+    if (_remotePlayback) {
+      return _queueTracks.isEmpty ? null : _queueTracks.first;
+    }
+    final currentTrack = _currentTrack;
+    return currentTrack == null ? null : _tracks[currentTrack];
+  }
 
   @override
   void initState() {
@@ -375,7 +414,15 @@ class _PlayerHomeState extends State<PlayerHome> {
       if (mounted) setState(() => _duration = duration);
     });
     _player.errorStream.listen((error) {
-      if (mounted) setState(() => _playbackError = error.message);
+      if (!mounted) return;
+      final message = error.message;
+      setState(() {
+        _playbackError = message;
+        if (_remotePlayback) {
+          _youTubeError = 'YouTube playback failed: $message';
+        }
+      });
+      if (_remotePlayback) _showMessage('YouTube playback failed: $message');
     });
   }
 
@@ -473,6 +520,234 @@ class _PlayerHomeState extends State<PlayerHome> {
     ),
   );
 
+  String get _youTubeAlbum => 'YouTube${_youTubeMode ? ' · Experimental' : ''}';
+
+  Future<void> _submitYouTubeInput(String input) async {
+    final uri = Uri.tryParse(input.trim());
+    if (uri != null &&
+        (uri.scheme == 'http' || uri.scheme == 'https') &&
+        uri.host.isNotEmpty) {
+      if (YouTubeService.isYouTubePageUrl(input)) {
+        const message =
+            'YouTube links are web pages, not direct audio files. Search for '
+            'the song title, or paste an authorized direct audio-file URL.';
+        setState(() {
+          _youTubeError = message;
+          _youTubeResults = const [];
+          _youTubeRateLimited = false;
+        });
+        _showMessage(message);
+        return;
+      }
+      await _downloadDirectAudioUrl(input.trim());
+      return;
+    }
+    await _searchYouTube(input);
+  }
+
+  Future<void> _downloadDirectAudioUrl(String url) async {
+    if (_youTubeLoading) return;
+    setState(() {
+      _youTubeLoading = true;
+      _youTubeError = null;
+      _youTubeRateLimited = false;
+      _youTubeResults = const [];
+      _downloadProgress.remove('direct-audio-url');
+    });
+    try {
+      final supportDirectory = await getApplicationSupportDirectory();
+      final staging = Directory(p.join(supportDirectory.path, 'downloads'));
+      await staging.create(recursive: true);
+      final download = await _youTubeService.downloadAudioUrl(
+        url,
+        staging,
+        onProgress: (progress) {
+          if (!mounted || progress == null) return;
+          setState(() => _downloadProgress['direct-audio-url'] = progress);
+        },
+      );
+      final track = await _libraryRepository.registerDownloadedTrack(
+        filePath: download.filePath,
+        title: download.title,
+        artist: download.author,
+        album: download.album,
+        duration: download.duration,
+        fallbackArtwork: download.artworkBytes,
+      );
+      if (!mounted) return;
+      setState(() {
+        _youTubeLoading = false;
+        _downloadProgress.remove('direct-audio-url');
+        _tracks.add(track);
+        _queueTracks.add(track);
+        _remotePlayback = false;
+        _youTubePlayingId = null;
+      });
+      _showMessage('Saved “${track.title}” to your library.');
+    } catch (error) {
+      if (!mounted) return;
+      final message = 'Could not import this audio URL: $error';
+      setState(() {
+        _youTubeLoading = false;
+        _downloadProgress.remove('direct-audio-url');
+        _youTubeError = message;
+      });
+      _showMessage(message);
+    }
+  }
+
+  Future<void> _searchYouTube(String query) async {
+    final trimmed = query.trim();
+    if (trimmed.isEmpty) {
+      setState(() {
+        _youTubeResults = const [];
+        _youTubeError = null;
+      });
+      return;
+    }
+    setState(() {
+      _youTubeLoading = true;
+      _youTubeError = null;
+    });
+    try {
+      final results = await _youTubeService.search(trimmed);
+      if (!mounted) return;
+      setState(() {
+        _youTubeResults = results;
+        _youTubeLoading = false;
+        _youTubeRateLimited = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _youTubeLoading = false;
+        _youTubeError = describeYouTubeError(error, 'search YouTube');
+        _youTubeRateLimited = isYouTubeRateLimit(error);
+      });
+    }
+  }
+
+  Future<void> _playYouTube(YouTubeSearchResult result) async {
+    if (_youTubePlayingId == result.id && _player.audioSource != null) {
+      await _togglePlayback();
+      return;
+    }
+    _showMessage('Preparing audio for “${result.title}”…');
+    setState(() => _youTubeError = null);
+    try {
+      final supportDirectory = await getApplicationSupportDirectory();
+      final cacheDirectory = Directory(
+        p.join(supportDirectory.path, 'youtube_playback'),
+      );
+      await cacheDirectory.create(recursive: true);
+      final audio = await _youTubeService.download(result, cacheDirectory);
+      await _player.setAudioSource(
+        AudioSource.file(
+          audio.filePath,
+          tag: MediaItem(
+            id: audio.filePath,
+            title: audio.title,
+            artist: audio.author,
+            album: _youTubeAlbum,
+            duration: audio.duration,
+          ),
+        ),
+        preload: true,
+      );
+      if (!mounted) return;
+      setState(() {
+        _remotePlayback = true;
+        _youTubePlayingId = result.id;
+        _queueTracks
+          ..clear()
+          ..add(
+            Track(
+              path: audio.filePath,
+              title: audio.title,
+              artist: audio.author,
+              album: _youTubeAlbum,
+              duration: audio.duration,
+              artworkBytes: null,
+            ),
+          );
+        _queueLoaded = false;
+        _currentTrack = null;
+        _playbackError = null;
+        _youTubeRateLimited = false;
+      });
+      unawaited(_player.play());
+      _showMessage('Playing from YouTube');
+    } catch (error) {
+      if (!mounted) return;
+      final message = describeYouTubeError(error, 'play this YouTube item');
+      setState(() {
+        _playbackError = message;
+        _youTubeError = message;
+        _youTubeRateLimited = isYouTubeRateLimit(error);
+      });
+      _showMessage(message);
+    }
+  }
+
+  Future<void> _openYouTubeItem(YouTubeSearchResult result) async {
+    final uri = Uri.tryParse(result.url);
+    if (uri == null) return;
+    try {
+      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (_) {
+      _showMessage('Could not open this YouTube link.');
+    }
+  }
+
+  Future<void> _downloadYouTube(YouTubeSearchResult result) async {
+    if (_downloadingVideoIds.contains(result.id)) return;
+    setState(() => _downloadingVideoIds.add(result.id));
+    _showMessage('Downloading “${result.title}”…');
+    try {
+      final supportDirectory = await getApplicationSupportDirectory();
+      final staging = Directory(p.join(supportDirectory.path, 'downloads'));
+      await staging.create(recursive: true);
+
+      final download = await _youTubeService.download(
+        result,
+        staging,
+        onProgress: (progress) {
+          if (!mounted) return;
+          setState(() => _downloadProgress[result.id] = progress);
+        },
+      );
+
+      final track = await _libraryRepository.registerDownloadedTrack(
+        filePath: download.filePath,
+        title: download.title,
+        artist: download.author,
+        album: download.album,
+        duration: download.duration,
+        fallbackArtwork: download.artworkBytes,
+      );
+
+      if (!mounted) return;
+      setState(() {
+        _downloadingVideoIds.remove(result.id);
+        _downloadProgress.remove(result.id);
+        _youTubeError = null;
+        _youTubeRateLimited = false;
+        _tracks.add(track);
+        _queueTracks.add(track);
+      });
+      _showMessage('Saved “${track.title}” to your library.');
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _downloadingVideoIds.remove(result.id);
+        _downloadProgress.remove(result.id);
+        _youTubeError = describeYouTubeError(error, 'download this song');
+        _youTubeRateLimited = isYouTubeRateLimit(error);
+      });
+      _showMessage(_youTubeError!);
+    }
+  }
+
   Future<void> _playTrack(int index, {List<Track>? queue}) async {
     if (index < 0 || index >= _tracks.length) return;
     final track = _tracks[index];
@@ -514,6 +789,19 @@ class _PlayerHomeState extends State<PlayerHome> {
   }
 
   Future<void> _togglePlayback() async {
+    // In remote (YouTube) mode the source is a single URL that is not part of
+    // the local library, so the library-specific branches must be skipped.
+    if (_remotePlayback) {
+      if (_player.processingState == ProcessingState.completed) {
+        await _player.seek(Duration.zero);
+        unawaited(_player.play());
+      } else if (_player.playing) {
+        await _player.pause();
+      } else {
+        unawaited(_player.play());
+      }
+      return;
+    }
     if (_tracks.isEmpty) return;
     if (_player.processingState == ProcessingState.completed) {
       await _player.seek(Duration.zero);
@@ -529,6 +817,8 @@ class _PlayerHomeState extends State<PlayerHome> {
 
   Future<void> _skip(int offset) async {
     if (_queueTracks.isEmpty) return;
+    // A single remote (YouTube) item has nothing to skip to.
+    if (_remotePlayback) return;
     final queueIndex = _currentTrack == null
         ? 0
         : _queueTracks.indexWhere(
@@ -539,6 +829,7 @@ class _PlayerHomeState extends State<PlayerHome> {
     final libraryIndex = _tracks.indexWhere(
       (track) => track.path == _queueTracks[next].path,
     );
+    if (libraryIndex < 0) return;
     await _playTrack(libraryIndex, queue: _queueTracks);
   }
 
@@ -575,7 +866,12 @@ class _PlayerHomeState extends State<PlayerHome> {
 
   void _openAbout() {
     Navigator.of(context).push<void>(
-      MaterialPageRoute<void>(builder: (_) => const AboutScreen()),
+      MaterialPageRoute<void>(
+        builder: (_) => AboutScreen(
+          youTubeSearchEnabled: widget.youTubeSearchEnabled,
+          onYouTubeSearchChanged: widget.onYouTubeSearchChanged,
+        ),
+      ),
     );
   }
 
@@ -783,6 +1079,16 @@ class _PlayerHomeState extends State<PlayerHome> {
                     )
                   : const Icon(Icons.library_add_rounded),
             ),
+          if (widget.youTubeSearchEnabled && !_searching)
+            IconButton(
+              tooltip: _youTubeMode
+                  ? 'Back to your library'
+                  : 'Search YouTube (experimental)',
+              onPressed: _toggleYouTubeMode,
+              isSelected: _youTubeMode,
+              icon: const Icon(Icons.smart_display_rounded),
+              selectedIcon: const Icon(Icons.smart_display_rounded),
+            ),
           if (_searching && isWide)
             SizedBox(width: 320, child: _buildSearchField())
           else if (_searching)
@@ -804,30 +1110,268 @@ class _PlayerHomeState extends State<PlayerHome> {
     );
   }
 
+  void _toggleYouTubeMode() {
+    setState(() {
+      _youTubeMode = !_youTubeMode;
+      _searching = true;
+      _youTubeError = null;
+      if (!_youTubeMode) _youTubeResults = const [];
+    });
+  }
+
   Widget _buildSearchField() {
+    final colorScheme = Theme.of(context).colorScheme;
     return TextField(
       controller: _searchController,
       autofocus: true,
+      textInputAction: _youTubeMode
+          ? TextInputAction.search
+          : TextInputAction.done,
       onChanged: (_) => setState(() {}),
+      onSubmitted: _youTubeMode ? _submitYouTubeInput : null,
       decoration: InputDecoration(
-        hintText: 'Search your library',
-        prefixIcon: const Icon(Icons.search_rounded),
-        suffixIcon: IconButton(
-          tooltip: 'Close search',
-          onPressed: () => setState(() {
-            _searching = false;
-            _searchController.clear();
-          }),
-          icon: const Icon(Icons.close_rounded),
+        hintText: _youTubeMode
+            ? 'Search YouTube or paste an authorized audio URL'
+            : 'Search your library',
+        prefixIcon: Icon(
+          _youTubeMode ? Icons.smart_display_rounded : Icons.search_rounded,
+        ),
+        suffixIcon: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (_youTubeMode)
+              IconButton(
+                tooltip: 'Search YouTube or import an authorized audio URL',
+                onPressed: _youTubeLoading
+                    ? null
+                    : () => _submitYouTubeInput(_searchController.text),
+                icon: const Icon(Icons.arrow_forward_rounded),
+              ),
+            IconButton(
+              tooltip: 'Close search',
+              onPressed: () => setState(() {
+                _searching = false;
+                _searchController.clear();
+              }),
+              icon: const Icon(Icons.close_rounded),
+            ),
+          ],
         ),
         isDense: true,
+        enabledBorder: _youTubeMode
+            ? OutlineInputBorder(
+                borderRadius: BorderRadius.circular(28),
+                borderSide: BorderSide(
+                  color: colorScheme.primary.withValues(alpha: 0.45),
+                ),
+              )
+            : null,
         border: OutlineInputBorder(borderRadius: BorderRadius.circular(28)),
       ),
     );
   }
 
+  Widget _buildYouTubeSearch(bool isWide) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final query = _searchController.text.trim();
+    return ListView(
+      padding: EdgeInsets.fromLTRB(isWide ? 36 : 20, 16, isWide ? 36 : 20, 24),
+      children: [
+        Row(
+          children: [
+            Icon(Icons.smart_display_rounded, color: colorScheme.primary),
+            const SizedBox(width: 10),
+            Text(
+              'YouTube search',
+              style: Theme.of(context).textTheme.headlineMedium,
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        Text(
+          'Experimental: prepare songs from YouTube for playback or save them '
+          'to your library.',
+          style: Theme.of(
+            context,
+          ).textTheme.bodyLarge?.copyWith(color: colorScheme.onSurfaceVariant),
+        ),
+        if (!youTubeExperimentalSupported)
+          Padding(
+            padding: const EdgeInsets.only(top: 12),
+            child: Card(
+              color: colorScheme.errorContainer,
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Text(
+                  'YouTube playback is currently supported on desktop only.',
+                  style: TextStyle(color: colorScheme.onErrorContainer),
+                ),
+              ),
+            ),
+          ),
+        const SizedBox(height: 20),
+        if (query.isEmpty)
+          _buildPlaylistEmptyState(
+            icon: Icons.youtube_searched_for_rounded,
+            title: 'Search YouTube',
+            message: 'Type a song or artist in the search bar above.',
+            action: const SizedBox.shrink(),
+          )
+        else if (_youTubeLoading)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 56),
+            child: Center(
+              child: SizedBox(
+                width: 260,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const CircularProgressIndicator(),
+                    if (_downloadProgress['direct-audio-url'] case final p?)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 16),
+                        child: LinearProgressIndicator(value: p),
+                      ),
+                  ],
+                ),
+              ),
+            ),
+          )
+        else if (_youTubeError != null)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 32),
+            child: Column(
+              children: [
+                Icon(
+                  Icons.cloud_off_rounded,
+                  color: colorScheme.error,
+                  size: 40,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  _youTubeError!,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: colorScheme.error),
+                ),
+                const SizedBox(height: 12),
+                if (!_youTubeRateLimited)
+                  FilledButton.tonalIcon(
+                    onPressed: () => _submitYouTubeInput(query),
+                    icon: const Icon(Icons.refresh_rounded),
+                    label: const Text('Try again'),
+                  ),
+              ],
+            ),
+          )
+        else if (_youTubeResults.isEmpty)
+          _buildPlaylistEmptyState(
+            icon: Icons.search_off_rounded,
+            title: 'No results',
+            message: 'Nothing matched “$query” on YouTube.',
+            action: const SizedBox.shrink(),
+          )
+        else
+          for (final result in _youTubeResults)
+            _buildYouTubeRow(result, isWide),
+      ],
+    );
+  }
+
+  Widget _buildYouTubeRow(YouTubeSearchResult result, bool isWide) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: ListTile(
+        contentPadding: EdgeInsets.symmetric(horizontal: isWide ? 12 : 4),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        leading: ClipRRect(
+          borderRadius: BorderRadius.circular(10),
+          child: Image.network(
+            result.thumbnailUrl,
+            width: 48,
+            height: 48,
+            fit: BoxFit.cover,
+            errorBuilder: (context, error, stackTrace) => Container(
+              width: 48,
+              height: 48,
+              color: colorScheme.surfaceContainerHighest,
+              child: Icon(
+                Icons.smart_display_rounded,
+                color: colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ),
+        title: Text(result.title, maxLines: 2, overflow: TextOverflow.ellipsis),
+        subtitle: Text(
+          result.author,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              _formatDuration(result.duration),
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                color: colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(width: 6),
+            if (_downloadingVideoIds.contains(result.id))
+              SizedBox.square(
+                dimension: 40,
+                child: Center(
+                  child: SizedBox.square(
+                    dimension: 22,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2.5,
+                      value: _downloadProgress[result.id],
+                    ),
+                  ),
+                ),
+              )
+            else if (_isYouTubeDownloaded(result.id))
+              IconButton(
+                tooltip: 'Already in your library',
+                onPressed: null,
+                icon: Icon(
+                  Icons.download_done_rounded,
+                  color: colorScheme.primary,
+                ),
+              )
+            else
+              IconButton(
+                tooltip: 'Download to your library',
+                onPressed: () => _downloadYouTube(result),
+                icon: const Icon(Icons.download_rounded),
+              ),
+            IconButton(
+              tooltip: 'Play from YouTube',
+              onPressed: () => _playYouTube(result),
+              icon: Icon(
+                _youTubePlayingId == result.id && _isPlaying
+                    ? Icons.equalizer_rounded
+                    : Icons.play_arrow_rounded,
+              ),
+            ),
+          ],
+        ),
+        onTap: () => _playYouTube(result),
+        onLongPress: () => _openYouTubeItem(result),
+      ),
+    );
+  }
+
+  bool _isYouTubeDownloaded(String videoId) {
+    return _tracks.any((track) => track.path.contains('[$videoId]'));
+  }
+
   Widget _buildContent(List<Track> visibleTracks, bool isWide) {
     final colorScheme = Theme.of(context).colorScheme;
+    if (_youTubeMode) {
+      return _buildYouTubeSearch(isWide);
+    }
     if (_section == 3) {
       Playlist? activePlaylist;
       for (final playlist in _playlists) {
@@ -1800,14 +2344,23 @@ class _PlayerHomeState extends State<PlayerHome> {
 }
 
 class AboutScreen extends StatelessWidget {
-  const AboutScreen({super.key});
+  const AboutScreen({
+    super.key,
+    required this.youTubeSearchEnabled,
+    required this.onYouTubeSearchChanged,
+  });
+
+  final bool youTubeSearchEnabled;
+  final ValueChanged<bool> onYouTubeSearchChanged;
 
   static final _profileUri = Uri.parse('https://github.com/Zetsukae');
   static final _repositoryUri = Uri.parse('https://github.com/Zetsukae/Aether');
-  static final _licenseUri =
-      Uri.parse('https://github.com/Zetsukae/Aether/blob/main/LICENSE');
-  static final _avatarUri =
-      Uri.parse('https://avatars.githubusercontent.com/u/187494372?v=4');
+  static final _licenseUri = Uri.parse(
+    'https://github.com/Zetsukae/Aether/blob/main/LICENSE',
+  );
+  static final _avatarUri = Uri.parse(
+    'https://avatars.githubusercontent.com/u/187494372?v=4',
+  );
 
   Future<void> _openLink(BuildContext context, Uri uri) async {
     try {
@@ -1860,8 +2413,8 @@ class AboutScreen extends StatelessWidget {
                       Text(
                         'Local music. Yours to keep.',
                         style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                              color: colorScheme.onSurfaceVariant,
-                            ),
+                          color: colorScheme.onSurfaceVariant,
+                        ),
                       ),
                     ],
                   ),
@@ -1914,6 +2467,19 @@ class AboutScreen extends StatelessWidget {
                   onTap: () => _openLink(context, _repositoryUri),
                 ),
                 const Divider(height: 24),
+                const _AboutSectionLabel(label: 'EXPERIMENTAL'),
+                SwitchListTile.adaptive(
+                  contentPadding: EdgeInsets.zero,
+                  value: youTubeSearchEnabled,
+                  onChanged: onYouTubeSearchChanged,
+                  secondary: const Icon(Icons.smart_display_outlined),
+                  title: const Text('Experimental'),
+                  subtitle: const Text(
+                    'Search YouTube, prepare songs for playback, and save '
+                    'them to your library. Off by default.',
+                  ),
+                ),
+                const Divider(height: 24),
                 const _AboutSectionLabel(label: 'LICENSE'),
                 ListTile(
                   contentPadding: EdgeInsets.zero,
@@ -1944,10 +2510,10 @@ class _AboutSectionLabel extends StatelessWidget {
       child: Text(
         label,
         style: Theme.of(context).textTheme.labelMedium?.copyWith(
-              color: Theme.of(context).colorScheme.primary,
-              fontWeight: FontWeight.w700,
-              letterSpacing: 0,
-            ),
+          color: Theme.of(context).colorScheme.primary,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 0,
+        ),
       ),
     );
   }
