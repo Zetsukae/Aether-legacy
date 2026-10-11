@@ -14,12 +14,14 @@ void main() {
         home: AboutScreen(
           youTubeSearchEnabled: enabled,
           onYouTubeSearchChanged: (value) => enabled = value,
+          customWindowBarEnabled: true,
+          onCustomWindowBarChanged: (_) {},
         ),
       ),
     );
 
     // The switch lives further down the list; scroll it into view.
-    final switchFinder = find.byType(SwitchListTile);
+    final switchFinder = find.widgetWithText(SwitchListTile, 'Experimental');
     await tester.scrollUntilVisible(
       switchFinder,
       200,

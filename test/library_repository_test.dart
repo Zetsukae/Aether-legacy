@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -94,6 +95,40 @@ void main() {
     ).loadTracks();
 
     expect(restored.single.title, 'Original Song Name');
+  });
+
+  test('keeps downloaded artist, album and cover, and allows editing them',
+      () async {
+    final download = File('${temporaryDirectory.path}/Song [abc].m4a');
+    await download.writeAsBytes([]);
+    await repository.registerDownloadedTrack(
+      filePath: download.path,
+      title: 'Song',
+      artist: 'Artist',
+      album: 'YouTube',
+      duration: null,
+      fallbackArtwork: Uint8List.fromList([1, 2, 3]),
+    );
+
+    final restored = (await repository.loadTracks()).single;
+    expect(restored.title, 'Song');
+    expect(restored.artist, 'Artist');
+    expect(restored.album, 'YouTube');
+    expect(restored.artworkBytes, [1, 2, 3]);
+
+    final newCover = File('${temporaryDirectory.path}/new.png');
+    await newCover.writeAsBytes([9, 8]);
+    await repository.saveTrackEdits(
+      path: restored.path,
+      title: 'Renamed',
+      artist: 'New Artist',
+      coverSourcePath: newCover.path,
+    );
+
+    final edited = (await repository.loadTracks()).single;
+    expect(edited.title, 'Renamed');
+    expect(edited.artist, 'New Artist');
+    expect(edited.artworkBytes, [9, 8]);
   });
 }
 

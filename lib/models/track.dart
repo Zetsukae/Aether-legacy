@@ -21,6 +21,18 @@ class Track {
   final Uint8List? artworkBytes;
 }
 
+class TrackDraft {
+  const TrackDraft({
+    required this.title,
+    required this.artist,
+    this.coverSourcePath,
+  });
+
+  final String title;
+  final String artist;
+  final String? coverSourcePath;
+}
+
 typedef _TrackMetadataRequest = ({String path, String? fallbackTitle});
 
 Future<Track> loadTrack(String path, {String? fallbackTitle}) async {

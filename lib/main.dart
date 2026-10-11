@@ -11,8 +11,10 @@ import 'package:just_audio_background/just_audio_background.dart';
 import 'package:just_audio_media_kit/just_audio_media_kit.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:window_manager/window_manager.dart';
 
 import 'models/playlist.dart';
 import 'models/track.dart';
@@ -26,10 +28,28 @@ Future<void> main() async {
     await JustAudioBackground.init(
       androidNotificationChannelId: 'com.aether.player.audio',
       androidNotificationChannelName: 'Aether playback',
+      androidNotificationIcon: 'drawable/ic_notification',
       androidNotificationOngoing: true,
     );
   }
   JustAudioMediaKit.ensureInitialized();
+  if (_isDesktopPlatform) {
+    await windowManager.ensureInitialized();
+    final customWindowBar =
+        await SharedPreferencesAsync().getBool('about.customWindowBar') ??
+        true;
+    await windowManager.waitUntilReadyToShow(
+      WindowOptions(
+        titleBarStyle: customWindowBar
+            ? TitleBarStyle.hidden
+            : TitleBarStyle.normal,
+      ),
+      () async {
+        await windowManager.show();
+        await windowManager.focus();
+      },
+    );
+  }
   runApp(const AetherApp());
 }
 
@@ -55,6 +75,7 @@ class _AetherAppState extends State<AetherApp> {
   int _accentIndex = 0;
   bool _useSystemColors = true;
   bool _youTubeSearch = false;
+  bool _customWindowBar = true;
 
   @override
   void initState() {
@@ -72,8 +93,12 @@ class _AetherAppState extends State<AetherApp> {
       final youTubeSearch = await _preferences.getBool(
         'about.experimentalYoutube',
       );
+      final customWindowBar = await _preferences.getBool(
+        'about.customWindowBar',
+      );
       if (!mounted) return;
       setState(() {
+        _customWindowBar = customWindowBar ?? true;
         _youTubeSearch = youTubeSearch ?? false;
         _themeMode = ThemeMode.values.firstWhere(
           (value) => value.name == mode,
@@ -105,6 +130,18 @@ class _AetherAppState extends State<AetherApp> {
   void _setYouTubeSearch(bool value) {
     setState(() => _youTubeSearch = value);
     unawaited(_preferences.setBool('about.experimentalYoutube', value));
+  }
+
+  void _setCustomWindowBar(bool value) {
+    setState(() => _customWindowBar = value);
+    unawaited(_preferences.setBool('about.customWindowBar', value));
+    if (_isDesktopPlatform) {
+      unawaited(
+        windowManager.setTitleBarStyle(
+          value ? TitleBarStyle.hidden : TitleBarStyle.normal,
+        ),
+      );
+    }
   }
 
   void _showAppearance(BuildContext context, bool supportsSystemColors) {
@@ -149,6 +186,16 @@ class _AetherAppState extends State<AetherApp> {
                   ),
             useMaterial3: true,
           ),
+          builder: (context, child) {
+            final content = child ?? const SizedBox.shrink();
+            if (!_isDesktopPlatform || !_customWindowBar) return content;
+            return Column(
+              children: [
+                const _WindowBar(),
+                Expanded(child: content),
+              ],
+            );
+          },
           home: PlayerHome(
             youTubeSearchEnabled: _youTubeSearch,
             onOpenAppearance: (context) => _showAppearance(
@@ -156,6 +203,8 @@ class _AetherAppState extends State<AetherApp> {
               lightDynamic != null && darkDynamic != null,
             ),
             onYouTubeSearchChanged: _setYouTubeSearch,
+            customWindowBarEnabled: _customWindowBar,
+            onCustomWindowBarChanged: _setCustomWindowBar,
           ),
         );
       },
@@ -338,11 +387,15 @@ class PlayerHome extends StatefulWidget {
     required this.onOpenAppearance,
     required this.youTubeSearchEnabled,
     required this.onYouTubeSearchChanged,
+    required this.customWindowBarEnabled,
+    required this.onCustomWindowBarChanged,
   });
 
   final ValueChanged<BuildContext> onOpenAppearance;
   final bool youTubeSearchEnabled;
   final ValueChanged<bool> onYouTubeSearchChanged;
+  final bool customWindowBarEnabled;
+  final ValueChanged<bool> onCustomWindowBarChanged;
 
   @override
   State<PlayerHome> createState() => _PlayerHomeState();
@@ -394,6 +447,9 @@ class _PlayerHomeState extends State<PlayerHome> {
   void initState() {
     super.initState();
     _loadLibrary();
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      unawaited(Permission.notification.request());
+    }
     _indexSubscription = _player.currentIndexStream.listen((index) {
       if (!mounted || index == null || index >= _queueTracks.length) return;
       final libraryIndex = _tracks.indexWhere(
@@ -833,6 +889,35 @@ class _PlayerHomeState extends State<PlayerHome> {
     await _playTrack(libraryIndex, queue: _queueTracks);
   }
 
+  Future<void> _editTrack(Track track) async {
+    if (!_tracks.any((item) => item.path == track.path)) return;
+    final draft = await showModalBottomSheet<TrackDraft>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (context) => _TrackEditorSheet(track: track),
+    );
+    if (draft == null) return;
+    try {
+      final updated = await _libraryRepository.saveTrackEdits(
+        path: track.path,
+        title: draft.title,
+        artist: draft.artist,
+        coverSourcePath: draft.coverSourcePath,
+      );
+      if (!mounted) return;
+      setState(() {
+        for (final list in [_tracks, _queueTracks]) {
+          final index = list.indexWhere((item) => item.path == updated.path);
+          if (index >= 0) list[index] = updated;
+        }
+      });
+    } catch (error) {
+      _showMessage('Could not save song details: $error');
+    }
+  }
+
   void _toggleLikedTrack(String path) {
     setState(() {
       if (!_likedTracks.add(path)) _likedTracks.remove(path);
@@ -859,6 +944,7 @@ class _PlayerHomeState extends State<PlayerHome> {
           onShowQueue: _showQueue,
           isLiked: (path) => _likedTracks.contains(path),
           onToggleLiked: _toggleLikedTrack,
+          onEditTrack: (track) => unawaited(_editTrack(track)),
         ),
       ),
     );
@@ -870,6 +956,8 @@ class _PlayerHomeState extends State<PlayerHome> {
         builder: (_) => AboutScreen(
           youTubeSearchEnabled: widget.youTubeSearchEnabled,
           onYouTubeSearchChanged: widget.onYouTubeSearchChanged,
+          customWindowBarEnabled: widget.customWindowBarEnabled,
+          onCustomWindowBarChanged: widget.onCustomWindowBarChanged,
         ),
       ),
     );
@@ -1006,7 +1094,7 @@ class _PlayerHomeState extends State<PlayerHome> {
                       ),
                     ),
                   ),
-                  _buildPlayerBar(isWide),
+                  if (_playing != null) _buildPlayerBar(isWide),
                 ],
               ),
             ),
@@ -1151,6 +1239,9 @@ class _PlayerHomeState extends State<PlayerHome> {
               tooltip: 'Close search',
               onPressed: () => setState(() {
                 _searching = false;
+                _youTubeMode = false;
+                _youTubeError = null;
+                _youTubeResults = const [];
                 _searchController.clear();
               }),
               icon: const Icon(Icons.close_rounded),
@@ -1428,7 +1519,7 @@ class _PlayerHomeState extends State<PlayerHome> {
           Row(
             children: [
               Text(
-                _section == 0 ? 'Recently added' : heading,
+                _section == 0 ? 'Recently added' : 'Songs',
                 style: Theme.of(context).textTheme.titleLarge,
               ),
               const Spacer(),
@@ -1967,6 +2058,7 @@ class _PlayerHomeState extends State<PlayerHome> {
             ],
           ),
           onTap: () => _playTrack(index, queue: queue),
+          onLongPress: () => unawaited(_editTrack(track)),
         ),
       ),
     );
@@ -2063,31 +2155,54 @@ class _PlayerHomeState extends State<PlayerHome> {
           onHorizontalDragStart: (_) => _miniPlayerDragDistance = 0,
           onHorizontalDragUpdate: _handleMiniPlayerDragUpdate,
           onHorizontalDragEnd: _handleMiniPlayerDragEnd,
-          child: InkWell(
-            onTap: track == null ? null : _openNowPlaying,
-            borderRadius: BorderRadius.circular(16),
-            child: Padding(
-              padding: const EdgeInsets.symmetric(vertical: 2),
-              child: Row(
-                children: [
-                  _buildArtwork(track, size: 48),
-                  const SizedBox(width: 12),
-                  Expanded(child: _buildTrackLabel(title, artist)),
-                  IconButton.filledTonal(
-                    tooltip: _isPlaying ? 'Pause' : 'Play',
-                    onPressed: track == null ? null : _togglePlayback,
-                    icon: Icon(
-                      _isPlaying
-                          ? Icons.pause_rounded
-                          : Icons.play_arrow_rounded,
-                    ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              InkWell(
+                onTap: track == null ? null : _openNowPlaying,
+                borderRadius: BorderRadius.circular(16),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Row(
+                    children: [
+                      _buildArtwork(track, size: 48),
+                      const SizedBox(width: 12),
+                      Expanded(child: _buildTrackLabel(title, artist)),
+                      IconButton.filledTonal(
+                        tooltip: _isPlaying ? 'Pause' : 'Play',
+                        onPressed: track == null ? null : _togglePlayback,
+                        icon: Icon(
+                          _isPlaying
+                              ? Icons.pause_rounded
+                              : Icons.play_arrow_rounded,
+                        ),
+                      ),
+                    ],
                   ),
-                ],
+                ),
               ),
-            ),
+              const SizedBox(height: 8),
+              _buildMiniProgress(),
+            ],
           ),
         ),
       ),
+    );
+  }
+
+  Widget _buildMiniProgress() {
+    return StreamBuilder<Duration>(
+      stream: _player.positionStream,
+      initialData: _player.position,
+      builder: (context, snapshot) {
+        final total = _duration?.inMilliseconds ?? 0;
+        final current = snapshot.data?.inMilliseconds ?? 0;
+        return LinearProgressIndicator(
+          value: total <= 0 ? 0 : (current / total).clamp(0.0, 1.0),
+          minHeight: 3,
+          borderRadius: BorderRadius.circular(2),
+        );
+      },
     );
   }
 
@@ -2348,10 +2463,14 @@ class AboutScreen extends StatelessWidget {
     super.key,
     required this.youTubeSearchEnabled,
     required this.onYouTubeSearchChanged,
+    required this.customWindowBarEnabled,
+    required this.onCustomWindowBarChanged,
   });
 
   final bool youTubeSearchEnabled;
   final ValueChanged<bool> onYouTubeSearchChanged;
+  final bool customWindowBarEnabled;
+  final ValueChanged<bool> onCustomWindowBarChanged;
 
   static final _profileUri = Uri.parse('https://github.com/Zetsukae');
   static final _repositoryUri = Uri.parse('https://github.com/Zetsukae/Aether');
@@ -2449,14 +2568,14 @@ class AboutScreen extends StatelessWidget {
                 const ListTile(
                   contentPadding: EdgeInsets.zero,
                   leading: Icon(Icons.calendar_today_outlined),
-                  title: Text('Started'),
-                  subtitle: Text('09/10/2026'),
+                  title: Text('Update release'),
+                  subtitle: Text('11/10/2026'),
                 ),
                 const ListTile(
                   contentPadding: EdgeInsets.zero,
                   leading: Icon(Icons.new_releases_outlined),
                   title: Text('Version'),
-                  subtitle: Text('1.0.0-abf'),
+                  subtitle: Text('1.1.0-abf'),
                 ),
                 ListTile(
                   contentPadding: EdgeInsets.zero,
@@ -2493,6 +2612,20 @@ class AboutScreen extends StatelessWidget {
                     onTap: () => showDialog<void>(
                       context: context,
                       builder: (_) => const _YouTubeServerDialog(),
+                    ),
+                  ),
+                ],
+                if (_isDesktopPlatform) ...[
+                  const Divider(height: 24),
+                  const _AboutSectionLabel(label: 'WINDOW'),
+                  SwitchListTile.adaptive(
+                    contentPadding: EdgeInsets.zero,
+                    value: customWindowBarEnabled,
+                    onChanged: onCustomWindowBarChanged,
+                    secondary: const Icon(Icons.web_asset_rounded),
+                    title: const Text('Custom window bar'),
+                    subtitle: const Text(
+                      "Use Aether's own title bar instead of the system one.",
                     ),
                   ),
                 ],
@@ -2600,6 +2733,144 @@ class _YouTubeServerDialogState extends State<_YouTubeServerDialog> {
   }
 }
 
+bool get _isDesktopPlatform =>
+    !kIsWeb && (Platform.isWindows || Platform.isLinux || Platform.isMacOS);
+
+class _WindowBar extends StatefulWidget {
+  const _WindowBar();
+
+  @override
+  State<_WindowBar> createState() => _WindowBarState();
+}
+
+class _WindowBarState extends State<_WindowBar> with WindowListener {
+  bool _maximized = false;
+
+  @override
+  void initState() {
+    super.initState();
+    windowManager.addListener(this);
+    unawaited(_syncMaximized());
+  }
+
+  @override
+  void dispose() {
+    windowManager.removeListener(this);
+    super.dispose();
+  }
+
+  Future<void> _syncMaximized() async {
+    final maximized = await windowManager.isMaximized();
+    if (mounted) setState(() => _maximized = maximized);
+  }
+
+  @override
+  void onWindowMaximize() => setState(() => _maximized = true);
+
+  @override
+  void onWindowUnmaximize() => setState(() => _maximized = false);
+
+  Future<void> _toggleMaximize() async {
+    if (_maximized) {
+      await windowManager.unmaximize();
+    } else {
+      await windowManager.maximize();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Material(
+      color: colorScheme.surfaceContainer,
+      child: SizedBox(
+        height: 40,
+        child: Row(
+          children: [
+            Expanded(
+              child: DragToMoveArea(
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onDoubleTap: _toggleMaximize,
+                ),
+              ),
+            ),
+            _WindowButton(
+              icon: Icons.remove_rounded,
+              label: 'Minimize',
+              onPressed: () => windowManager.minimize(),
+            ),
+            _WindowButton(
+              icon: _maximized
+                  ? Icons.filter_none_rounded
+                  : Icons.crop_square_rounded,
+              label: _maximized ? 'Restore' : 'Maximize',
+              onPressed: () => _toggleMaximize(),
+            ),
+            _WindowButton(
+              icon: Icons.close_rounded,
+              label: 'Close',
+              danger: true,
+              onPressed: () => windowManager.close(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _WindowButton extends StatelessWidget {
+  const _WindowButton({
+    required this.icon,
+    required this.label,
+    required this.onPressed,
+    this.danger = false,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onPressed;
+  final bool danger;
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    return Semantics(
+      button: true,
+      label: label,
+      child: SizedBox(
+        width: 46,
+        height: 40,
+        child: IconButton(
+          onPressed: onPressed,
+          icon: Icon(icon, size: 18),
+          style: ButtonStyle(
+            shape: WidgetStatePropertyAll(
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            padding: const WidgetStatePropertyAll(EdgeInsets.zero),
+            minimumSize: const WidgetStatePropertyAll(Size(46, 40)),
+            backgroundColor: WidgetStateProperty.resolveWith(
+              (states) => states.contains(WidgetState.hovered)
+                  ? (danger
+                        ? colorScheme.error
+                        : colorScheme.onSurface.withValues(alpha: 0.08))
+                  : Colors.transparent,
+            ),
+            foregroundColor: WidgetStateProperty.resolveWith(
+              (states) =>
+                  danger && states.contains(WidgetState.hovered)
+                  ? colorScheme.onError
+                  : colorScheme.onSurfaceVariant,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _AboutSectionLabel extends StatelessWidget {
   const _AboutSectionLabel({required this.label});
 
@@ -2632,6 +2903,7 @@ class _NowPlayingScreen extends StatelessWidget {
     required this.onShowQueue,
     required this.isLiked,
     required this.onToggleLiked,
+    required this.onEditTrack,
   });
 
   final AudioPlayer player;
@@ -2643,6 +2915,7 @@ class _NowPlayingScreen extends StatelessWidget {
   final VoidCallback onShowQueue;
   final bool Function(String) isLiked;
   final ValueChanged<String> onToggleLiked;
+  final ValueChanged<Track> onEditTrack;
 
   @override
   Widget build(BuildContext context) {
@@ -2682,6 +2955,7 @@ class _NowPlayingScreen extends StatelessWidget {
                   if (action == 'like' && track != null) {
                     onToggleLiked(track.path);
                   }
+                  if (action == 'edit' && track != null) onEditTrack(track);
                 },
                 itemBuilder: (context) => [
                   PopupMenuItem(
@@ -2692,6 +2966,11 @@ class _NowPlayingScreen extends StatelessWidget {
                           ? 'Remove from liked songs'
                           : 'Add to liked songs',
                     ),
+                  ),
+                  PopupMenuItem(
+                    value: 'edit',
+                    enabled: track != null,
+                    child: const Text('Edit song details'),
                   ),
                   const PopupMenuItem(value: 'queue', child: Text('Up next')),
                 ],
@@ -2906,6 +3185,158 @@ class _NowPlayingScreen extends StatelessWidget {
           },
         );
       },
+    );
+  }
+}
+
+class _TrackEditorSheet extends StatefulWidget {
+  const _TrackEditorSheet({required this.track});
+
+  final Track track;
+
+  @override
+  State<_TrackEditorSheet> createState() => _TrackEditorSheetState();
+}
+
+class _TrackEditorSheetState extends State<_TrackEditorSheet> {
+  late final TextEditingController _titleController;
+  late final TextEditingController _artistController;
+  String? _coverSourcePath;
+  bool _isPickingCover = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _titleController = TextEditingController(text: widget.track.title);
+    _artistController = TextEditingController(text: widget.track.artist);
+  }
+
+  @override
+  void dispose() {
+    _titleController.dispose();
+    _artistController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickCover() async {
+    setState(() => _isPickingCover = true);
+    try {
+      final result = await FilePicker.pickFiles(type: FileType.image);
+      final path = result.firstOrNull?.path;
+      if (path != null && mounted) setState(() => _coverSourcePath = path);
+    } finally {
+      if (mounted) setState(() => _isPickingCover = false);
+    }
+  }
+
+  void _submit() {
+    final title = _titleController.text.trim();
+    if (title.isEmpty) return;
+    final artist = _artistController.text.trim();
+    Navigator.pop(
+      context,
+      TrackDraft(
+        title: title,
+        artist: artist.isEmpty ? 'Unknown artist' : artist,
+        coverSourcePath: _coverSourcePath,
+      ),
+    );
+  }
+
+  Widget _buildCoverPreview(ColorScheme colorScheme) {
+    final coverSource = _coverSourcePath;
+    final artwork = widget.track.artworkBytes;
+    final Widget child = coverSource != null
+        ? Image.file(File(coverSource), fit: BoxFit.cover)
+        : artwork != null
+        ? Image.memory(artwork, fit: BoxFit.cover)
+        : ColoredBox(
+            color: colorScheme.secondaryContainer,
+            child: Center(
+              child: Icon(
+                Icons.music_note_rounded,
+                color: colorScheme.onSecondaryContainer,
+              ),
+            ),
+          );
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(10),
+      child: SizedBox.square(dimension: 72, child: child),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    final hasCover = _coverSourcePath != null || widget.track.artworkBytes != null;
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        24,
+        8,
+        24,
+        MediaQuery.viewInsetsOf(context).bottom + 24,
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Edit song',
+              style: Theme.of(context).textTheme.headlineSmall,
+            ),
+            const SizedBox(height: 18),
+            Row(
+              children: [
+                _buildCoverPreview(colorScheme),
+                const SizedBox(width: 12),
+                OutlinedButton.icon(
+                  onPressed: _isPickingCover ? null : _pickCover,
+                  icon: _isPickingCover
+                      ? const SizedBox.square(
+                          dimension: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.add_photo_alternate_outlined),
+                  label: Text(hasCover ? 'Change cover' : 'Add cover'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 18),
+            TextField(
+              controller: _titleController,
+              maxLength: 120,
+              textCapitalization: TextCapitalization.sentences,
+              decoration: const InputDecoration(
+                labelText: 'Title',
+                border: OutlineInputBorder(),
+                counterText: '',
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _artistController,
+              maxLength: 120,
+              textCapitalization: TextCapitalization.words,
+              decoration: const InputDecoration(
+                labelText: 'Artist',
+                border: OutlineInputBorder(),
+                counterText: '',
+              ),
+            ),
+            const SizedBox(height: 18),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: _titleController.text.trim().isEmpty ? null : _submit,
+                icon: const Icon(Icons.check_rounded),
+                label: const Text('Save changes'),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

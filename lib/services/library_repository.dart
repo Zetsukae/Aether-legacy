@@ -9,6 +9,29 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/playlist.dart';
 import '../models/track.dart';
 
+class _TrackOverride {
+  const _TrackOverride({this.title, this.artist, this.album, this.coverPath});
+
+  final String? title;
+  final String? artist;
+  final String? album;
+  final String? coverPath;
+
+  Map<String, Object?> toJson() => {
+        'title': title,
+        'artist': artist,
+        'album': album,
+        'coverPath': coverPath,
+      };
+
+  factory _TrackOverride.fromJson(Map<String, dynamic> json) => _TrackOverride(
+        title: json['title'] as String?,
+        artist: json['artist'] as String?,
+        album: json['album'] as String?,
+        coverPath: json['coverPath'] as String?,
+      );
+}
+
 class LibraryRepository {
   LibraryRepository({
     SharedPreferencesAsync? preferences,
@@ -21,6 +44,8 @@ class LibraryRepository {
   static const _sourceMapKey = 'library.importedSources';
   static const _likedPathsKey = 'library.likedPaths';
   static const _playlistsKey = 'library.playlists';
+  static const _trackOverridesKey = 'library.trackOverrides';
+  static const _coversDirectory = 'track_covers';
 
   final SharedPreferencesAsync _preferences;
   final Future<Directory> Function() _supportDirectoryProvider;
@@ -39,12 +64,14 @@ class LibraryRepository {
         }
       } catch (_) {}
     }
+    final overrides = await _loadOverrides();
     final tracks = <Track>[];
     final validPaths = <String>[];
     for (final path in savedPaths) {
       if (!await File(path).exists()) continue;
       try {
-        tracks.add(await loadTrack(path, fallbackTitle: fallbackTitles[path]));
+        final track = await loadTrack(path, fallbackTitle: fallbackTitles[path]);
+        tracks.add(await _applyOverride(track, overrides[path]));
         validPaths.add(path);
       } catch (_) {}
     }
@@ -96,18 +123,104 @@ class LibraryRepository {
     final savedPaths =
         await _preferences.getStringList(_trackPathsKey) ?? <String>[];
     final copyPath = await _moveInto(filePath, 'music');
-    final track = Track(
+    final embeddedArtwork = await _readArtwork(copyPath);
+    final coverPath = embeddedArtwork == null && fallbackArtwork != null
+        ? await _writeCover(fallbackArtwork, copyPath)
+        : null;
+    final overrides = await _loadOverrides();
+    overrides[copyPath] = _TrackOverride(
+      title: title,
+      artist: artist,
+      album: album,
+      coverPath: coverPath,
+    );
+    await _saveOverrides(overrides);
+    savedPaths.add(copyPath);
+    await _preferences.setStringList(_trackPathsKey, savedPaths);
+    return Track(
       path: copyPath,
       title: title,
       artist: artist,
       album: album,
       duration: duration,
-      artworkBytes: await _readArtwork(copyPath) ?? fallbackArtwork,
+      artworkBytes: embeddedArtwork ?? fallbackArtwork,
     );
-    savedPaths.add(copyPath);
-    await _preferences.setStringList(_trackPathsKey, savedPaths);
-    return track;
   }
+
+  /// Saves edited title, artist and optional new cover for a library track.
+  Future<Track> saveTrackEdits({
+    required String path,
+    required String title,
+    required String artist,
+    String? coverSourcePath,
+  }) async {
+    final overrides = await _loadOverrides();
+    final previous = overrides[path];
+    final updated = _TrackOverride(
+      title: title,
+      artist: artist,
+      album: previous?.album,
+      coverPath: coverSourcePath == null
+          ? previous?.coverPath
+          : await _copyInto(coverSourcePath, _coversDirectory),
+    );
+    overrides[path] = updated;
+    await _saveOverrides(overrides);
+    return _applyOverride(await loadTrack(path), updated);
+  }
+
+  Future<Track> _applyOverride(Track track, _TrackOverride? override) async {
+    if (override == null) return track;
+    final coverFile =
+        override.coverPath == null ? null : File(override.coverPath!);
+    final artwork = coverFile != null && await coverFile.exists()
+        ? await coverFile.readAsBytes()
+        : track.artworkBytes;
+    return Track(
+      path: track.path,
+      title: override.title ?? track.title,
+      artist: override.artist ?? track.artist,
+      album: override.album ?? track.album,
+      duration: track.duration,
+      artworkBytes: artwork,
+    );
+  }
+
+  Future<String> _writeCover(Uint8List bytes, String trackPath) async {
+    final directory = await _subdirectory(_coversDirectory);
+    final coverPath = _uniquePath(
+      directory,
+      '${p.basenameWithoutExtension(trackPath)}.jpg',
+    );
+    await File(coverPath).writeAsBytes(bytes);
+    return coverPath;
+  }
+
+  Future<Map<String, _TrackOverride>> _loadOverrides() async {
+    final overrides = <String, _TrackOverride>{};
+    final json = await _preferences.getString(_trackOverridesKey);
+    if (json == null) return overrides;
+    try {
+      final decoded = jsonDecode(json) as Map<String, dynamic>;
+      for (final entry in decoded.entries) {
+        try {
+          overrides[entry.key] = _TrackOverride.fromJson(
+            entry.value as Map<String, dynamic>,
+          );
+        } catch (_) {}
+      }
+    } catch (_) {}
+    return overrides;
+  }
+
+  Future<void> _saveOverrides(Map<String, _TrackOverride> overrides) =>
+      _preferences.setString(
+        _trackOverridesKey,
+        jsonEncode({
+          for (final entry in overrides.entries)
+            entry.key: entry.value.toJson(),
+        }),
+      );
 
   Future<Uint8List?> _readArtwork(String path) async {
     try {
