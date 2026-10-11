@@ -3,9 +3,8 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// A single result returned from a YouTube search.
 class YouTubeSearchResult {
@@ -46,8 +45,8 @@ class DownloadedAudio {
   final Uint8List? artworkBytes;
 }
 
-class YtDlpException implements Exception {
-  const YtDlpException(this.message, {this.isRateLimited = false});
+class YouTubeServiceException implements Exception {
+  const YouTubeServiceException(this.message, {this.isRateLimited = false});
 
   final String message;
   final bool isRateLimited;
@@ -56,315 +55,258 @@ class YtDlpException implements Exception {
   String toString() => message;
 }
 
-typedef YtDlpRunner =
-    Future<ProcessResult> Function(
-      String executable,
-      List<String> arguments, {
-      void Function(String line)? onOutput,
-    });
+/// Address and API key of the self-hosted YouTube server (see `server/`).
+/// Stored in shared preferences and read on every request.
+class YouTubeServerConfig {
+  const YouTubeServerConfig({required this.baseUrl, required this.apiKey});
 
-Future<ProcessResult> _runYtDlp(
-  String executable,
-  List<String> arguments, {
-  void Function(String line)? onOutput,
-}) async {
-  final process = await Process.start(executable, arguments, runInShell: false);
-  final stdoutBuffer = StringBuffer();
-  final stderrBuffer = StringBuffer();
+  static const _baseUrlKey = 'youtube.serverUrl';
+  static const _apiKeyKey = 'youtube.serverApiKey';
 
-  Future<void> collect(Stream<List<int>> stream, StringBuffer buffer) async {
-    await for (final line
-        in stream.transform(utf8.decoder).transform(const LineSplitter())) {
-      buffer.writeln(line);
-      onOutput?.call(line);
-    }
+  final String baseUrl;
+  final String apiKey;
+
+  bool get isConfigured => baseUrl.isNotEmpty && apiKey.isNotEmpty;
+
+  static Future<YouTubeServerConfig> load() async {
+    final preferences = SharedPreferencesAsync();
+    final baseUrl = await preferences.getString(_baseUrlKey);
+    final apiKey = await preferences.getString(_apiKeyKey);
+    return YouTubeServerConfig(
+      baseUrl: (baseUrl ?? '').trim(),
+      apiKey: (apiKey ?? '').trim(),
+    );
   }
 
-  await Future.wait([
-    collect(process.stdout, stdoutBuffer),
-    collect(process.stderr, stderrBuffer),
-  ]);
-  final exitCode = await process.exitCode;
-  return ProcessResult(
-    process.pid,
-    exitCode,
-    stdoutBuffer.toString(),
-    stderrBuffer.toString(),
-  );
+  static Future<void> save({
+    required String baseUrl,
+    required String apiKey,
+  }) async {
+    final preferences = SharedPreferencesAsync();
+    await preferences.setString(
+      _baseUrlKey,
+      baseUrl.trim().replaceAll(RegExp(r'/+$'), ''),
+    );
+    await preferences.setString(_apiKeyKey, apiKey.trim());
+  }
 }
 
-/// Uses the bundled `yt-dlp` executable for YouTube search and audio
-/// extraction. Search metadata is parsed as JSON; downloads stay in the
-/// selected audio format and need no separate ffmpeg installation.
+/// Searches and downloads YouTube audio through the self-hosted yt-dlp server.
 class YouTubeService {
-  YouTubeService({
-    YtDlpRunner? runner,
-    Future<String> Function()? executablePath,
-  }) : _runner = runner ?? _runYtDlp,
-       _executablePathResolver = executablePath ?? _resolveBundledExecutable;
+  YouTubeService();
 
-  static const _ytDlpVersion = '2026.08.19';
-  static const _metadataTimeout = Duration(seconds: 45);
+  static const _downloadTimeout = Duration(seconds: 300);
   static const _connectionTimeout = Duration(seconds: 30);
   static const _responseTimeout = Duration(seconds: 45);
+  static const _serverUserAgent = 'Aether';
 
-  final YtDlpRunner _runner;
-  final Future<String> Function() _executablePathResolver;
-  Future<String>? _executablePath;
-
-  Future<String> get _executable =>
-      _executablePath ??= _executablePathResolver();
-
-  static Future<String> _resolveBundledExecutable() async {
-    late final String assetPath;
-    late final String executableName;
-    if (Platform.isWindows) {
-      assetPath = 'assets/tools/yt-dlp.exe';
-      executableName = 'yt-dlp.exe';
-    } else if (Platform.isLinux) {
-      assetPath = 'assets/tools/yt-dlp_linux';
-      executableName = 'yt-dlp';
-    } else {
-      throw UnsupportedError(
-        'YouTube search is supported on Windows and Linux only.',
+  static Future<YouTubeServerConfig> _requireConfig() async {
+    final config = await YouTubeServerConfig.load();
+    if (!config.isConfigured) {
+      throw const YouTubeServiceException(
+        'Set up the YouTube server in About first.',
       );
     }
+    return config;
+  }
 
-    final supportDirectory = await getApplicationSupportDirectory();
-    final toolsDirectory = Directory(
-      p.join(supportDirectory.path, 'tools', 'yt-dlp', _ytDlpVersion),
-    );
-    final executable = File(p.join(toolsDirectory.path, executableName));
-    if (!await executable.exists()) {
-      await toolsDirectory.create(recursive: true);
-      final data = await rootBundle.load(assetPath);
-      await executable.writeAsBytes(
-        data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes),
-        flush: true,
+  static Uri _serverUri(
+    YouTubeServerConfig config,
+    String path, [
+    Map<String, String>? query,
+  ]) {
+    final base = Uri.tryParse(config.baseUrl);
+    if (base == null || !base.hasScheme || base.host.isEmpty) {
+      throw const YouTubeServiceException(
+        'The YouTube server address is invalid. Check it in About.',
       );
     }
+    return base.replace(path: '${base.path}$path', queryParameters: query);
+  }
 
-    if (Platform.isLinux) {
-      final result = await Process.run('chmod', ['u+x', executable.path]);
-      if (result.exitCode != 0) {
-        throw const YtDlpException(
-          'Could not make the bundled yt-dlp executable.',
-        );
+  /// Sends an authenticated GET request and passes a successful response to
+  /// [handle]. The HTTP client is always closed afterwards.
+  static Future<T> _serverRequest<T>(
+    Uri uri,
+    YouTubeServerConfig config,
+    Future<T> Function(HttpClientResponse response) handle, {
+    Duration timeout = _responseTimeout,
+  }) async {
+    final client = HttpClient()..connectionTimeout = _connectionTimeout;
+    try {
+      final request = await client.getUrl(uri).timeout(_connectionTimeout);
+      request.headers
+        ..set('X-API-Key', config.apiKey)
+        ..set(HttpHeaders.userAgentHeader, _serverUserAgent);
+      final response = await request.close().timeout(_connectionTimeout);
+      if (response.statusCode != HttpStatus.ok) {
+        throw await _serverError(response);
       }
+      return await handle(response).timeout(timeout);
+    } on YouTubeServiceException {
+      rethrow;
+    } on TimeoutException {
+      throw const YouTubeServiceException(
+        'The YouTube server did not respond in time.',
+      );
+    } on IOException {
+      throw const YouTubeServiceException(
+        'Could not reach the YouTube server. Check your connection.',
+      );
+    } finally {
+      client.close(force: true);
     }
-    return executable.path;
   }
 
-  static bool isYouTubePageUrl(String rawUrl) {
-    final uri = Uri.tryParse(rawUrl.trim());
-    if (uri == null) return false;
-    final host = uri.host.toLowerCase().replaceFirst(RegExp(r'\.$'), '');
-    return host == 'youtu.be' ||
-        host == 'youtube.com' ||
-        host.endsWith('.youtube.com') ||
-        host == 'youtube-nocookie.com' ||
-        host.endsWith('.youtube-nocookie.com');
+  static Future<YouTubeServiceException> _serverError(
+    HttpClientResponse response,
+  ) async {
+    if (response.statusCode == HttpStatus.unauthorized) {
+      await response.drain<void>();
+      return const YouTubeServiceException(
+        'The YouTube server rejected the API key. Check it in About.',
+      );
+    }
+
+    final body = await response
+        .transform(utf8.decoder)
+        .join()
+        .catchError((_) => '');
+    String? detail;
+    try {
+      final json = jsonDecode(body);
+      if (json is Map && json['detail'] is String) {
+        detail = json['detail'] as String;
+      }
+    } catch (_) {
+      detail = null;
+    }
+
+    final rateLimited =
+        response.statusCode == HttpStatus.tooManyRequests ||
+        (detail ?? '').contains('not a bot');
+    final suffix = detail == null ? '' : ': $detail';
+    return YouTubeServiceException(
+      'YouTube server error (HTTP ${response.statusCode})$suffix',
+      isRateLimited: rateLimited,
+    );
   }
 
-  /// Searches YouTube and maps the raw results into [YouTubeSearchResult]s.
+  static YouTubeSearchResult? _searchResultFromJson(Map<String, dynamic> item) {
+    final id = item['id'];
+    final title = item['title'];
+    if (id is! String || title is! String) return null;
+
+    final seconds = item['duration'];
+    return YouTubeSearchResult(
+      id: id,
+      title: title,
+      author: item['author'] as String? ?? 'Unknown artist',
+      duration: seconds is num ? Duration(seconds: seconds.toInt()) : null,
+      thumbnailUrl: item['thumbnail'] as String? ?? '',
+      url: item['url'] as String? ?? 'https://www.youtube.com/watch?v=$id',
+    );
+  }
+
+  /// Searches YouTube through the self-hosted server.
   Future<List<YouTubeSearchResult>> search(String query) async {
     final trimmed = query.trim();
     if (trimmed.isEmpty) return const [];
-    final result = await _runner(await _executable, [
-      '--dump-single-json',
-      '--flat-playlist',
-      '--no-warnings',
-      '--socket-timeout',
-      '20',
-      'ytsearch15:$trimmed',
-    ]).timeout(_metadataTimeout);
-    if (result.exitCode != 0) {
-      throw _failureFromResult(result, 'search YouTube');
-    }
 
-    final decoded = jsonDecode(result.stdout);
-    if (decoded is! Map) {
-      throw const YtDlpException(
-        'yt-dlp returned an unexpected search result.',
-      );
-    }
-    final entries = decoded['entries'];
-    if (entries is! List) return const [];
-    return entries
-        .whereType<Map>()
-        .map(_searchResultFromJson)
-        .whereType<YouTubeSearchResult>()
-        .toList();
+    final config = await _requireConfig();
+    final uri = _serverUri(config, '/search', {'q': trimmed, 'limit': '15'});
+    return _serverRequest<List<YouTubeSearchResult>>(uri, config, (
+      response,
+    ) async {
+      final body = await response.transform(utf8.decoder).join();
+      final data = jsonDecode(body) as Map<String, dynamic>;
+      final items = (data['results'] as List?) ?? const [];
+      return items
+          .whereType<Map<String, dynamic>>()
+          .map(_searchResultFromJson)
+          .whereType<YouTubeSearchResult>()
+          .toList();
+    });
   }
 
   /// Saves a video's best available audio format into [targetDirectory].
-  /// [onProgress] receives values between 0 and 1 while yt-dlp downloads it.
+  /// [onProgress] receives values between 0 and 1 while downloading.
   Future<DownloadedAudio> download(
     YouTubeSearchResult result,
     Directory targetDirectory, {
     void Function(double progress)? onProgress,
   }) async {
     await targetDirectory.create(recursive: true);
-    final outputBase = _uniqueOutputBase(targetDirectory, result);
-    final outputTemplate = '$outputBase.%(ext)s';
-    String? downloadedPath;
-    final commandResult = await _runner(
-      await _executable,
-      [
-        '--newline',
-        '--no-warnings',
-        '--no-playlist',
-        '--socket-timeout',
-        '20',
-        '--format',
-        'bestaudio[ext=m4a]/bestaudio',
-        '--embed-metadata',
-        '--embed-thumbnail',
-        '--output',
-        outputTemplate,
-        '--progress-template',
-        'download:__AETHER_PROGRESS__%(progress._percent_str)s',
-        '--print',
-        'after_move:__AETHER_FILE__%(filepath)s',
-        result.url,
-      ],
-      onOutput: (line) {
-        const filePrefix = '__AETHER_FILE__';
-        if (line.startsWith(filePrefix)) {
-          downloadedPath = line.substring(filePrefix.length).trim();
-          return;
+    final config = await _requireConfig();
+    final uri = _serverUri(config, '/audio/${result.id}');
+
+    return _serverRequest<DownloadedAudio>(
+      uri,
+      config,
+      (response) async {
+        final mimeType = response.headers.contentType?.mimeType ?? '';
+        final extension = mimeType.contains('webm') ? '.webm' : '.m4a';
+        final outputPath =
+            '${_uniqueOutputBase(targetDirectory, result)}$extension';
+        await _writeAudioResponse(response, outputPath, onProgress);
+
+        Uint8List? artworkBytes;
+        if (result.thumbnailUrl.isNotEmpty) {
+          try {
+            artworkBytes = await _downloadBytes(result.thumbnailUrl);
+          } catch (_) {
+            artworkBytes = null;
+          }
         }
-        final progress = RegExp(
-          r'__AETHER_PROGRESS__\s*(\d+(?:\.\d+)?)',
-        ).firstMatch(line);
-        if (progress != null) {
+
+        return DownloadedAudio(
+          filePath: outputPath,
+          title: result.title,
+          author: result.author,
+          album: 'YouTube',
+          duration: result.duration,
+          artworkBytes: artworkBytes,
+        );
+      },
+      timeout: _downloadTimeout,
+    );
+  }
+
+  static Future<void> _writeAudioResponse(
+    HttpClientResponse response,
+    String outputPath,
+    void Function(double progress)? onProgress,
+  ) async {
+    final file = File(outputPath);
+    final sink = file.openWrite();
+    final totalBytes = response.contentLength;
+    var receivedBytes = 0;
+    try {
+      await for (final chunk in response) {
+        receivedBytes += chunk.length;
+        sink.add(chunk);
+        if (totalBytes > 0) {
           onProgress?.call(
-            (double.parse(progress.group(1)!) / 100).clamp(0, 1).toDouble(),
+            (receivedBytes / totalBytes).clamp(0, 1).toDouble(),
           );
         }
-      },
-    );
-    if (commandResult.exitCode != 0) {
-      await _deleteYtDlpOutputs(targetDirectory, outputBase);
-      throw _failureFromResult(commandResult, 'download this song');
-    }
-
-    final filePath = downloadedPath;
-    if (filePath == null || !await File(filePath).exists()) {
-      await _deleteYtDlpOutputs(targetDirectory, outputBase);
-      throw const YtDlpException('yt-dlp did not produce an audio file.');
-    }
-    if (await File(filePath).length() == 0) {
-      await _deleteYtDlpOutputs(targetDirectory, outputBase);
-      throw const YtDlpException('yt-dlp produced an empty audio file.');
-    }
-    onProgress?.call(1);
-
-    Uint8List? artworkBytes;
-    if (result.thumbnailUrl.isNotEmpty) {
-      try {
-        artworkBytes = await _downloadBytes(result.thumbnailUrl);
-      } catch (_) {
-        artworkBytes = null;
       }
-    }
-
-    return DownloadedAudio(
-      filePath: filePath,
-      title: result.title,
-      author: result.author,
-      album: 'YouTube',
-      duration: result.duration,
-      artworkBytes: artworkBytes,
-    );
-  }
-
-  static YouTubeSearchResult? _searchResultFromJson(Map value) {
-    final id = '${value['id'] ?? ''}'.trim();
-    final title = '${value['title'] ?? ''}'.trim();
-    final rawDuration = value['duration'];
-    if (id.isEmpty || title.isEmpty || rawDuration is! num) return null;
-
-    var thumbnail = value['thumbnail'] is String
-        ? value['thumbnail'] as String
-        : '';
-    final thumbnails = value['thumbnails'];
-    if (thumbnail.isEmpty && thumbnails is List && thumbnails.isNotEmpty) {
-      final lastThumbnail = thumbnails.last;
-      if (lastThumbnail is Map) {
-        thumbnail = '${lastThumbnail['url'] ?? ''}';
+      await sink.close();
+    } catch (_) {
+      await sink.close().catchError((_) {});
+      if (await file.exists()) {
+        await file.delete();
       }
+      rethrow;
     }
-    final videoUrl = '${value['webpage_url'] ?? ''}'.trim();
-    return YouTubeSearchResult(
-      id: id,
-      title: title,
-      author:
-          '${value['channel'] ?? value['uploader'] ?? value['artist'] ?? 'YouTube'}',
-      duration: Duration(milliseconds: (rawDuration * 1000).round()),
-      thumbnailUrl: thumbnail,
-      url: videoUrl.isNotEmpty
-          ? videoUrl
-          : 'https://www.youtube.com/watch?v=$id',
-    );
-  }
 
-  static YtDlpException _failureFromResult(
-    ProcessResult result,
-    String action,
-  ) {
-    final details = '${result.stderr}\n${result.stdout}'
-        .split('\n')
-        .map((line) => line.trim())
-        .where((line) => line.isNotEmpty)
-        .toList();
-    final message = details.isEmpty
-        ? 'yt-dlp exited with code ${result.exitCode}.'
-        : details.last;
-    final rateLimited = RegExp(
-      r'HTTP Error 429|Too Many Requests|rate.?limit',
-      caseSensitive: false,
-    ).hasMatch('$message ${result.stderr}');
-    if (rateLimited) {
-      return const YtDlpException(
-        'YouTube is temporarily rate-limiting requests from this network. '
-        'Wait for access to return before trying again.',
-        isRateLimited: true,
+    if (receivedBytes == 0) {
+      await file.delete();
+      throw const YouTubeServiceException(
+        'The YouTube server returned an empty audio file.',
       );
     }
-    return YtDlpException('Could not $action: $message');
-  }
-
-  static String _uniqueOutputBase(
-    Directory directory,
-    YouTubeSearchResult result,
-  ) {
-    final baseName =
-        '${_sanitizeFileName(result.title)} [${_sanitizeFileName(result.id)}]';
-    var candidateName = baseName;
-    var suffix = 1;
-    bool collides(String name) => directory.listSync().any(
-      (entity) => p.basename(entity.path).startsWith('$name.'),
-    );
-    while (collides(candidateName)) {
-      candidateName = '$baseName ($suffix)';
-      suffix++;
-    }
-    return p.join(directory.path, candidateName);
-  }
-
-  static Future<void> _deleteYtDlpOutputs(
-    Directory directory,
-    String outputBase,
-  ) async {
-    final prefix = p.basename(outputBase);
-    await for (final entity in directory.list(followLinks: false)) {
-      if (p.basename(entity.path).startsWith('$prefix.')) {
-        try {
-          await entity.delete();
-        } catch (_) {}
-      }
-    }
+    onProgress?.call(1);
   }
 
   /// Downloads a caller-authorized direct audio URL into [targetDirectory].
@@ -492,8 +434,23 @@ class YouTubeService {
     }
   }
 
+  /// Whether [url] points at a YouTube page (watch, short or youtu.be link).
+  static bool isYouTubePageUrl(String url) {
+    final uri = Uri.tryParse(url.trim());
+    if (uri == null || uri.host.isEmpty) return false;
+    final host = uri.host.toLowerCase();
+    return host == 'youtu.be' ||
+        host == 'youtube.com' ||
+        host == 'www.youtube.com' ||
+        host == 'm.youtube.com' ||
+        host == 'music.youtube.com';
+  }
+
   Future<Uint8List> _downloadBytes(String url) async {
-    final client = HttpClient();
+    final client = HttpClient()
+      ..connectionTimeout = _connectionTimeout
+      ..userAgent =
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
     try {
       final request = await client.getUrl(Uri.parse(url));
       final response = await request.close().timeout(_connectionTimeout);
@@ -575,15 +532,33 @@ class YouTubeService {
     }
     return candidate;
   }
+
+  static String _uniqueOutputBase(
+    Directory directory,
+    YouTubeSearchResult result,
+  ) {
+    final baseName =
+        '${_sanitizeFileName(result.title)} [${_sanitizeFileName(result.id)}]';
+    var candidateName = baseName;
+    var suffix = 1;
+    bool collides(String name) => directory.listSync().any(
+      (entity) => p.basename(entity.path).startsWith('$name.'),
+    );
+    while (collides(candidateName)) {
+      candidateName = '$baseName ($suffix)';
+      suffix++;
+    }
+    return p.join(directory.path, candidateName);
+  }
 }
 
 String describeYouTubeError(Object error, String action) {
-  if (error is YtDlpException) return error.message;
+  if (error is YouTubeServiceException) return error.message;
   return 'Could not $action: $error';
 }
 
 bool isYouTubeRateLimit(Object error) =>
-    error is YtDlpException && error.isRateLimited;
+    error is YouTubeServiceException && error.isRateLimited;
 
-/// The YouTube experimental mode is supported on desktop platforms only.
-bool get youTubeExperimentalSupported => Platform.isWindows || Platform.isLinux;
+/// YouTube search is now supported on all platforms including mobile.
+bool get youTubeExperimentalSupported => true;

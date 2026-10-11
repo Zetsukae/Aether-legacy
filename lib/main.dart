@@ -2479,6 +2479,23 @@ class AboutScreen extends StatelessWidget {
                     'them to your library. Off by default.',
                   ),
                 ),
+                if (youTubeSearchEnabled) ...[
+                  const Divider(height: 24),
+                  const _AboutSectionLabel(label: 'YOUTUBE SERVER'),
+                  ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(Icons.dns_outlined),
+                    title: const Text('Server address and API key'),
+                    subtitle: const Text(
+                      'Your self-hosted yt-dlp server used for search and downloads.',
+                    ),
+                    trailing: const Icon(Icons.chevron_right_rounded),
+                    onTap: () => showDialog<void>(
+                      context: context,
+                      builder: (_) => const _YouTubeServerDialog(),
+                    ),
+                  ),
+                ],
                 const Divider(height: 24),
                 const _AboutSectionLabel(label: 'LICENSE'),
                 ListTile(
@@ -2494,6 +2511,91 @@ class AboutScreen extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _YouTubeServerDialog extends StatefulWidget {
+  const _YouTubeServerDialog();
+
+  @override
+  State<_YouTubeServerDialog> createState() => _YouTubeServerDialogState();
+}
+
+class _YouTubeServerDialogState extends State<_YouTubeServerDialog> {
+  final _urlController = TextEditingController();
+  final _apiKeyController = TextEditingController();
+  bool _loaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  @override
+  void dispose() {
+    _urlController.dispose();
+    _apiKeyController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final config = await YouTubeServerConfig.load();
+    if (!mounted) return;
+    setState(() {
+      _urlController.text = config.baseUrl;
+      _apiKeyController.text = config.apiKey;
+      _loaded = true;
+    });
+  }
+
+  Future<void> _save() async {
+    await YouTubeServerConfig.save(
+      baseUrl: _urlController.text,
+      apiKey: _apiKeyController.text,
+    );
+    if (mounted) Navigator.of(context).pop();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('YouTube server'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: _urlController,
+            enabled: _loaded,
+            keyboardType: TextInputType.url,
+            autocorrect: false,
+            decoration: const InputDecoration(
+              labelText: 'Server address',
+              hintText: 'http://100.120.110.88:8000',
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _apiKeyController,
+            enabled: _loaded,
+            obscureText: true,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: const InputDecoration(labelText: 'API key'),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: _loaded ? _save : null,
+          child: const Text('Save'),
+        ),
+      ],
     );
   }
 }
