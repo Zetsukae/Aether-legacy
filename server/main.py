@@ -11,6 +11,9 @@ from starlette.background import BackgroundTask
 
 API_KEY = os.environ.get("API_KEY", "")
 VIDEO_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
+PLAYLIST_ID = re.compile(r"^[A-Za-z0-9_-]{10,64}$")
+PLAYLIST_LIMIT = 200
+UNAVAILABLE_TITLES = {"[Private video]", "[Deleted video]"}
 
 app = FastAPI(title="Aether YouTube server")
 
@@ -55,6 +58,50 @@ def search(
 
     entries = [e for e in (data or {}).get("entries", []) if e and e.get("id")]
     return {"results": [_entry(e) for e in entries]}
+
+
+@app.get("/playlist", dependencies=[Depends(require_key)])
+def playlist(
+    id: str = Query(),
+    limit: int = Query(default=PLAYLIST_LIMIT, ge=1, le=PLAYLIST_LIMIT),
+) -> dict:
+    if not PLAYLIST_ID.match(id):
+        raise HTTPException(status_code=400, detail="Invalid playlist id")
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": "in_playlist",
+        "playlistend": limit,
+        "ignoreerrors": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            data = ydl.extract_info(f"https://www.youtube.com/playlist?list={id}", download=False)
+    except yt_dlp.utils.YoutubeDLError as e:
+        raise HTTPException(status_code=502, detail=f"Playlist lookup failed: {e}") from e
+
+    if not data:
+        raise HTTPException(status_code=404, detail="Playlist not found or not public")
+
+    # Private and deleted videos stay in the list with a placeholder title.
+    entries = [
+        e
+        for e in data.get("entries") or []
+        if e and VIDEO_ID.match(e.get("id") or "") and e.get("title") not in UNAVAILABLE_TITLES
+    ]
+    thumbnails = data.get("thumbnails") or []
+    thumbnail = thumbnails[-1].get("url", "") if thumbnails else ""
+    if not thumbnail and entries:
+        thumbnail = _entry(entries[0])["thumbnail"]
+    return {
+        "id": id,
+        "title": data.get("title") or "YouTube playlist",
+        "thumbnail": thumbnail,
+        "truncated": len(data.get("entries") or []) >= limit,
+        "entries": [_entry(e) for e in entries],
+    }
 
 
 @app.get("/audio/{video_id}", dependencies=[Depends(require_key)])

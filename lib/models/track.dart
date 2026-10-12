@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:audio_metadata_reader/audio_metadata_reader.dart';
 import 'package:flutter/foundation.dart';
 
+import '../services/cover_crop.dart';
+
 class Track {
   const Track({
     required this.path,
@@ -36,10 +38,10 @@ class TrackDraft {
 typedef _TrackMetadataRequest = ({String path, String? fallbackTitle});
 
 Future<Track> loadTrack(String path, {String? fallbackTitle}) async {
-  final details = await compute(
-    _readTrackDetails,
-    (path: path, fallbackTitle: fallbackTitle),
-  );
+  final details = await compute(_readTrackDetails, (
+    path: path,
+    fallbackTitle: fallbackTitle,
+  ));
   return Track(
     path: path,
     title: details['title']! as String,
@@ -48,16 +50,20 @@ Future<Track> loadTrack(String path, {String? fallbackTitle}) async {
     duration: details['duration'] == null
         ? null
         : Duration(milliseconds: details['duration']! as int),
-    artworkBytes: details['artwork'] as Uint8List?,
+    artworkBytes: await _squareArtwork(details['artwork'] as Uint8List?),
   );
 }
+
+Future<Uint8List?> _squareArtwork(Uint8List? artwork) async =>
+    artwork == null ? null : cropCoverToSquare(artwork);
 
 Map<String, Object?> _readTrackDetails(_TrackMetadataRequest request) {
   final path = request.path;
   final fileName = path.split(RegExp(r'[/\\]')).last;
   final extensionIndex = fileName.lastIndexOf('.');
-  final pathTitle =
-      extensionIndex > 0 ? fileName.substring(0, extensionIndex) : fileName;
+  final pathTitle = extensionIndex > 0
+      ? fileName.substring(0, extensionIndex)
+      : fileName;
   final fallbackTitle = _nonEmpty(request.fallbackTitle) ?? pathTitle;
 
   try {
@@ -67,8 +73,9 @@ Map<String, Object?> _readTrackDetails(_TrackMetadataRequest request) {
       'artist': _nonEmpty(metadata.artist) ?? 'Unknown artist',
       'album': _nonEmpty(metadata.album) ?? 'Unknown album',
       'duration': metadata.duration?.inMilliseconds,
-      'artwork':
-          metadata.pictures.isEmpty ? null : metadata.pictures.first.bytes,
+      'artwork': metadata.pictures.isEmpty
+          ? null
+          : metadata.pictures.first.bytes,
     };
   } catch (_) {
     return {

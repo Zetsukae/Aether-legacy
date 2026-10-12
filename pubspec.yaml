@@ -1,7 +1,7 @@
 name: aether_player
 description: A lightweight cross-platform music player.
 publish_to: none
-version: 1.0.0-abf+1
+version: 1.2.0-abf+1
 
 environment:
   sdk: '>=3.10.0 <4.0.0'

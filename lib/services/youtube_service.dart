@@ -25,6 +25,27 @@ class YouTubeSearchResult {
   final String url;
 }
 
+/// A public YouTube playlist listed by the server.
+class YouTubePlaylist {
+  const YouTubePlaylist({
+    required this.id,
+    required this.name,
+    required this.coverUrl,
+    required this.tracks,
+    this.truncated = false,
+  });
+
+  final String id;
+  final String name;
+  final String? coverUrl;
+  final List<YouTubeSearchResult> tracks;
+
+  /// True when the server stopped listing before the end of the playlist.
+  final bool truncated;
+
+  String get url => YouTubeService.playlistUrl(id);
+}
+
 /// A downloaded audio file together with the metadata needed to import it as
 /// a normal library track.
 class DownloadedAudio {
@@ -98,7 +119,9 @@ class YouTubeService {
   static const _downloadTimeout = Duration(seconds: 300);
   static const _connectionTimeout = Duration(seconds: 30);
   static const _responseTimeout = Duration(seconds: 45);
+  static const _playlistTimeout = Duration(seconds: 120);
   static const _serverUserAgent = 'Aether';
+  static final _playlistIdPattern = RegExp(r'^[A-Za-z0-9_-]{10,64}$');
 
   static Future<YouTubeServerConfig> _requireConfig() async {
     final config = await YouTubeServerConfig.load();
@@ -229,6 +252,30 @@ class YouTubeService {
     });
   }
 
+  /// Lists a public playlist through the self-hosted server.
+  Future<YouTubePlaylist> fetchPlaylist(String id) async {
+    final config = await _requireConfig();
+    final uri = _serverUri(config, '/playlist', {'id': id});
+    return _serverRequest<YouTubePlaylist>(uri, config, (response) async {
+      final body = await response.transform(utf8.decoder).join();
+      final data = jsonDecode(body) as Map<String, dynamic>;
+      final items = (data['entries'] as List?) ?? const [];
+      final thumbnail = data['thumbnail'] as String?;
+      final title = (data['title'] as String?)?.trim();
+      return YouTubePlaylist(
+        id: id,
+        name: title == null || title.isEmpty ? 'YouTube playlist' : title,
+        coverUrl: thumbnail == null || thumbnail.isEmpty ? null : thumbnail,
+        tracks: items
+            .whereType<Map<String, dynamic>>()
+            .map(_searchResultFromJson)
+            .whereType<YouTubeSearchResult>()
+            .toList(growable: false),
+        truncated: data['truncated'] == true,
+      );
+    }, timeout: _playlistTimeout);
+  }
+
   /// Saves a video's best available audio format into [targetDirectory].
   /// [onProgress] receives values between 0 and 1 while downloading.
   Future<DownloadedAudio> download(
@@ -240,36 +287,31 @@ class YouTubeService {
     final config = await _requireConfig();
     final uri = _serverUri(config, '/audio/${result.id}');
 
-    return _serverRequest<DownloadedAudio>(
-      uri,
-      config,
-      (response) async {
-        final mimeType = response.headers.contentType?.mimeType ?? '';
-        final extension = mimeType.contains('webm') ? '.webm' : '.m4a';
-        final outputPath =
-            '${_uniqueOutputBase(targetDirectory, result)}$extension';
-        await _writeAudioResponse(response, outputPath, onProgress);
+    return _serverRequest<DownloadedAudio>(uri, config, (response) async {
+      final mimeType = response.headers.contentType?.mimeType ?? '';
+      final extension = mimeType.contains('webm') ? '.webm' : '.m4a';
+      final outputPath =
+          '${_uniqueOutputBase(targetDirectory, result)}$extension';
+      await _writeAudioResponse(response, outputPath, onProgress);
 
-        Uint8List? artworkBytes;
-        if (result.thumbnailUrl.isNotEmpty) {
-          try {
-            artworkBytes = await _downloadBytes(result.thumbnailUrl);
-          } catch (_) {
-            artworkBytes = null;
-          }
+      Uint8List? artworkBytes;
+      if (result.thumbnailUrl.isNotEmpty) {
+        try {
+          artworkBytes = await _downloadBytes(result.thumbnailUrl);
+        } catch (_) {
+          artworkBytes = null;
         }
+      }
 
-        return DownloadedAudio(
-          filePath: outputPath,
-          title: result.title,
-          author: result.author,
-          album: 'YouTube',
-          duration: result.duration,
-          artworkBytes: artworkBytes,
-        );
-      },
-      timeout: _downloadTimeout,
-    );
+      return DownloadedAudio(
+        filePath: outputPath,
+        title: result.title,
+        author: result.author,
+        album: 'YouTube',
+        duration: result.duration,
+        artworkBytes: artworkBytes,
+      );
+    }, timeout: _downloadTimeout);
   }
 
   static Future<void> _writeAudioResponse(
@@ -286,9 +328,7 @@ class YouTubeService {
         receivedBytes += chunk.length;
         sink.add(chunk);
         if (totalBytes > 0) {
-          onProgress?.call(
-            (receivedBytes / totalBytes).clamp(0, 1).toDouble(),
-          );
+          onProgress?.call((receivedBytes / totalBytes).clamp(0, 1).toDouble());
         }
       }
       await sink.close();
@@ -444,6 +484,31 @@ class YouTubeService {
         host == 'www.youtube.com' ||
         host == 'm.youtube.com' ||
         host == 'music.youtube.com';
+  }
+
+  /// Returns the playlist ID in a YouTube link such as
+  /// `youtube.com/playlist?list=…` or a watch link carrying `list=…`, or null
+  /// when [input] is not a YouTube playlist link.
+  static String? playlistIdFromInput(String input) {
+    final trimmed = input.trim();
+    final uri = Uri.tryParse(
+      trimmed.contains('://') ? trimmed : 'https://$trimmed',
+    );
+    if (uri == null || !isYouTubePageUrl(uri.toString())) return null;
+    final id = uri.queryParameters['list'];
+    return id != null && _playlistIdPattern.hasMatch(id) ? id : null;
+  }
+
+  static String playlistUrl(String id) =>
+      'https://www.youtube.com/playlist?list=$id';
+
+  /// Downloads [url] as raw bytes, or returns null when it is unavailable.
+  Future<Uint8List?> fetchImage(String url) async {
+    try {
+      return await _downloadBytes(url);
+    } catch (_) {
+      return null;
+    }
   }
 
   Future<Uint8List> _downloadBytes(String url) async {

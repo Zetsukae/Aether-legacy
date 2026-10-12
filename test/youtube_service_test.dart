@@ -24,7 +24,6 @@ void main() {
     );
   });
 
-
   test('imports an authorized direct audio URL into a named file', () async {
     final audioBytes = List<int>.generate(128, (index) => index);
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -89,5 +88,41 @@ void main() {
       await server.close(force: true);
       await directory.delete(recursive: true);
     }
+  });
+
+  test('reads the playlist id from YouTube links', () {
+    const id = 'PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf';
+    expect(
+      YouTubeService.playlistIdFromInput(
+        'https://www.youtube.com/playlist?list=$id',
+      ),
+      id,
+    );
+    expect(
+      YouTubeService.playlistIdFromInput(
+        ' https://music.youtube.com/watch?v=6UF_qprQiu0&list=$id ',
+      ),
+      id,
+    );
+    expect(
+      YouTubeService.playlistIdFromInput('youtube.com/playlist?list=$id'),
+      id,
+    );
+  });
+
+  test('rejects links without a playlist or from other sites', () {
+    expect(
+      YouTubeService.playlistIdFromInput(
+        'https://www.youtube.com/watch?v=6UF_qprQiu0',
+      ),
+      isNull,
+    );
+    expect(
+      YouTubeService.playlistIdFromInput(
+        'https://evil.example/playlist?list=PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf',
+      ),
+      isNull,
+    );
+    expect(YouTubeService.playlistIdFromInput('not a link'), isNull);
   });
 }

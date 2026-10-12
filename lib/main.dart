@@ -18,8 +18,13 @@ import 'package:window_manager/window_manager.dart';
 
 import 'models/playlist.dart';
 import 'models/track.dart';
+import 'services/cover_crop.dart';
+import 'services/library_folder_channel.dart';
 import 'services/library_repository.dart';
+import 'services/spotify_import_service.dart';
+import 'services/spotify_service.dart';
 import 'services/youtube_service.dart';
+import 'widgets/spotify_import_sheets.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -36,8 +41,7 @@ Future<void> main() async {
   if (_isDesktopPlatform) {
     await windowManager.ensureInitialized();
     final customWindowBar =
-        await SharedPreferencesAsync().getBool('about.customWindowBar') ??
-        true;
+        await SharedPreferencesAsync().getBool('about.customWindowBar') ?? true;
     await windowManager.waitUntilReadyToShow(
       WindowOptions(
         titleBarStyle: customWindowBar
@@ -71,6 +75,9 @@ class _AetherAppState extends State<AetherApp> {
   ];
 
   final _preferences = SharedPreferencesAsync();
+  late final LibraryRepository _settingsStorage = LibraryRepository(
+    preferences: _preferences,
+  );
   ThemeMode _themeMode = ThemeMode.system;
   int _accentIndex = 0;
   bool _useSystemColors = true;
@@ -114,27 +121,38 @@ class _AetherAppState extends State<AetherApp> {
 
   void _setThemeMode(ThemeMode mode) {
     setState(() => _themeMode = mode);
-    unawaited(_preferences.setString('appearance.themeMode', mode.name));
+    unawaited(
+      _saveSetting(_preferences.setString('appearance.themeMode', mode.name)),
+    );
   }
 
   void _setAccent(int index) {
     setState(() => _accentIndex = index);
-    unawaited(_preferences.setInt('appearance.accentIndex', index));
+    unawaited(
+      _saveSetting(_preferences.setInt('appearance.accentIndex', index)),
+    );
   }
 
   void _setUseSystemColors(bool value) {
     setState(() => _useSystemColors = value);
-    unawaited(_preferences.setBool('appearance.useSystemColors', value));
+    unawaited(
+      _saveSetting(_preferences.setBool('appearance.useSystemColors', value)),
+    );
   }
 
   void _setYouTubeSearch(bool value) {
     setState(() => _youTubeSearch = value);
-    unawaited(_preferences.setBool('about.experimentalYoutube', value));
+    unawaited(
+      _saveSetting(_preferences.setBool('about.experimentalYoutube', value)),
+    );
   }
 
   void _setCustomWindowBar(bool value) {
     setState(() => _customWindowBar = value);
-    unawaited(_preferences.setBool('about.customWindowBar', value));
+    unawaited(
+      _saveSetting(_preferences.setBool('about.customWindowBar', value)),
+    );
+    unawaited(_settingsStorage.persistStateSnapshot());
     if (_isDesktopPlatform) {
       unawaited(
         windowManager.setTitleBarStyle(
@@ -142,6 +160,11 @@ class _AetherAppState extends State<AetherApp> {
         ),
       );
     }
+  }
+
+  Future<void> _saveSetting(Future<void> write) async {
+    await write;
+    await _settingsStorage.persistStateSnapshot();
   }
 
   void _showAppearance(BuildContext context, bool supportsSystemColors) {
@@ -413,6 +436,8 @@ class _PlayerHomeState extends State<PlayerHome> {
   Duration? _duration;
   String? _playbackError;
   String? _activePlaylistId;
+  // The playlist that started the current queue, or null for library/YouTube.
+  String? _playingPlaylistId;
   final AudioPlayer _player = AudioPlayer();
   final LibraryRepository _libraryRepository = LibraryRepository();
   final List<Track> _tracks = [];
@@ -425,6 +450,8 @@ class _PlayerHomeState extends State<PlayerHome> {
   StreamSubscription<Duration?>? _durationSubscription;
 
   final YouTubeService _youTubeService = YouTubeService();
+  final SpotifyService _spotifyService = SpotifyService();
+  bool _spotifySyncing = false;
   bool _youTubeMode = false;
   bool _remotePlayback = false;
   bool _youTubeLoading = false;
@@ -455,7 +482,12 @@ class _PlayerHomeState extends State<PlayerHome> {
       final libraryIndex = _tracks.indexWhere(
         (track) => track.path == _queueTracks[index].path,
       );
-      if (libraryIndex >= 0) setState(() => _currentTrack = libraryIndex);
+      if (libraryIndex >= 0) {
+        setState(() {
+          _currentTrack = libraryIndex;
+          _duration = _queueTracks[index].duration ?? _player.duration;
+        });
+      }
     });
     _playerStateSubscription = _player.playerStateStream.listen((state) {
       if (mounted) {
@@ -467,7 +499,12 @@ class _PlayerHomeState extends State<PlayerHome> {
       }
     });
     _durationSubscription = _player.durationStream.listen((duration) {
-      if (mounted) setState(() => _duration = duration);
+      if (!mounted) return;
+      final index = _player.currentIndex;
+      final trackDuration = index != null && index < _queueTracks.length
+          ? _queueTracks[index].duration
+          : null;
+      setState(() => _duration = trackDuration ?? duration);
     });
     _player.errorStream.listen((error) {
       if (!mounted) return;
@@ -494,6 +531,7 @@ class _PlayerHomeState extends State<PlayerHome> {
 
   Future<void> _loadLibrary() async {
     try {
+      if (Platform.isIOS) await _relinkLibraryFolder();
       final results = await Future.wait([
         _libraryRepository.loadTracks(),
         _libraryRepository.loadLikedPaths(),
@@ -508,6 +546,7 @@ class _PlayerHomeState extends State<PlayerHome> {
         _playlists.addAll(results[2] as List<Playlist>);
         _libraryLoading = false;
       });
+      if (Platform.isIOS) unawaited(_offerIosStorageChoiceIfNeeded());
     } catch (error) {
       if (!mounted) return;
       setState(() => _libraryLoading = false);
@@ -542,15 +581,10 @@ class _PlayerHomeState extends State<PlayerHome> {
         return;
       }
 
-      if (_queueLoaded) {
-        for (final track in addedTracks) {
-          await _player.addAudioSource(_audioSource(track));
-        }
-      }
+      await _addToQueue(addedTracks);
       setState(() {
         if (_tracks.isEmpty) _currentTrack = 0;
         _tracks.addAll(addedTracks);
-        _queueTracks.addAll(addedTracks);
         _playbackError = null;
       });
       if (unavailablePaths > 0) {
@@ -565,16 +599,62 @@ class _PlayerHomeState extends State<PlayerHome> {
     }
   }
 
-  AudioSource _audioSource(Track track) => AudioSource.file(
+  /// Appends tracks to the queue list and, when the player already has a
+  /// loaded queue, to the player too. Keeping both in step makes the player
+  /// index point at the right song.
+  Future<void> _addToQueue(Iterable<Track> added) async {
+    final tracks = added.toList(growable: false);
+    if (_queueLoaded) {
+      for (final track in tracks) {
+        await _player.addAudioSource(await _audioSource(track));
+      }
+    }
+    _queueTracks.addAll(tracks);
+  }
+
+  Future<AudioSource> _audioSource(Track track) async => _fileAudioSource(
     track.path,
-    tag: MediaItem(
+    MediaItem(
       id: track.path,
       title: track.title,
       artist: track.artist,
       album: track.album,
       duration: track.duration,
+      artUri: await _artworkUri(track.artworkBytes, track.path),
     ),
   );
+
+  /// On iOS, AVPlayer can report a wrong length for some downloaded files
+  /// (for example 8:50 for a 4:29 song), and the lock screen shows that value.
+  /// Clipping to the known duration makes the player report the real length.
+  AudioSource _fileAudioSource(String path, MediaItem tag) {
+    final source = AudioSource.file(path, tag: tag);
+    final duration = tag.duration;
+    if (defaultTargetPlatform != TargetPlatform.iOS ||
+        duration == null ||
+        duration <= Duration.zero) {
+      return source;
+    }
+    return ClippingAudioSource(
+      child: source,
+      start: Duration.zero,
+      end: duration,
+      tag: tag,
+    );
+  }
+
+  Future<Uri?> _artworkUri(Uint8List? artworkBytes, String key) async {
+    if (artworkBytes == null) return null;
+    final directory = Directory(
+      p.join((await getApplicationSupportDirectory()).path, 'artwork'),
+    );
+    await directory.create(recursive: true);
+    final file = File(p.join(directory.path, '${key.hashCode.abs()}_sq.png'));
+    if (!await file.exists()) {
+      await file.writeAsBytes(await cropCoverToSquare(artworkBytes));
+    }
+    return file.uri;
+  }
 
   String get _youTubeAlbum => 'YouTube${_youTubeMode ? ' · Experimental' : ''}';
 
@@ -630,12 +710,12 @@ class _PlayerHomeState extends State<PlayerHome> {
         duration: download.duration,
         fallbackArtwork: download.artworkBytes,
       );
+      await _addToQueue([track]);
       if (!mounted) return;
       setState(() {
         _youTubeLoading = false;
         _downloadProgress.remove('direct-audio-url');
         _tracks.add(track);
-        _queueTracks.add(track);
         _remotePlayback = false;
         _youTubePlayingId = null;
       });
@@ -698,14 +778,15 @@ class _PlayerHomeState extends State<PlayerHome> {
       await cacheDirectory.create(recursive: true);
       final audio = await _youTubeService.download(result, cacheDirectory);
       await _player.setAudioSource(
-        AudioSource.file(
+        _fileAudioSource(
           audio.filePath,
-          tag: MediaItem(
+          MediaItem(
             id: audio.filePath,
             title: audio.title,
             artist: audio.author,
             album: _youTubeAlbum,
             duration: audio.duration,
+            artUri: await _artworkUri(audio.artworkBytes, audio.filePath),
           ),
         ),
         preload: true,
@@ -713,6 +794,7 @@ class _PlayerHomeState extends State<PlayerHome> {
       if (!mounted) return;
       setState(() {
         _remotePlayback = true;
+        _playingPlaylistId = null;
         _youTubePlayingId = result.id;
         _queueTracks
           ..clear()
@@ -782,6 +864,7 @@ class _PlayerHomeState extends State<PlayerHome> {
         fallbackArtwork: download.artworkBytes,
       );
 
+      await _addToQueue([track]);
       if (!mounted) return;
       setState(() {
         _downloadingVideoIds.remove(result.id);
@@ -789,7 +872,6 @@ class _PlayerHomeState extends State<PlayerHome> {
         _youTubeError = null;
         _youTubeRateLimited = false;
         _tracks.add(track);
-        _queueTracks.add(track);
       });
       _showMessage('Saved “${track.title}” to your library.');
     } catch (error) {
@@ -804,7 +886,11 @@ class _PlayerHomeState extends State<PlayerHome> {
     }
   }
 
-  Future<void> _playTrack(int index, {List<Track>? queue}) async {
+  Future<void> _playTrack(
+    int index, {
+    List<Track>? queue,
+    String? playlistId,
+  }) async {
     if (index < 0 || index >= _tracks.length) return;
     final track = _tracks[index];
     final nextQueue = queue ?? _tracks;
@@ -819,13 +905,11 @@ class _PlayerHomeState extends State<PlayerHome> {
             (i) => i,
           ).every((i) => _queueTracks[i].path == nextQueue[i].path);
       if (!sameQueue) {
+        final sources = await Future.wait(nextQueue.map(_audioSource));
+        await _player.setAudioSources(sources, initialIndex: queueIndex);
         _queueTracks
           ..clear()
           ..addAll(nextQueue);
-        await _player.setAudioSources(
-          _queueTracks.map(_audioSource).toList(),
-          initialIndex: queueIndex,
-        );
         _queueLoaded = true;
       } else {
         await _player.seek(Duration.zero, index: queueIndex);
@@ -833,6 +917,9 @@ class _PlayerHomeState extends State<PlayerHome> {
       if (mounted) {
         setState(() {
           _currentTrack = index;
+          _playingPlaylistId = playlistId;
+          _remotePlayback = false;
+          _youTubePlayingId = null;
           _playbackError = null;
         });
       }
@@ -886,7 +973,11 @@ class _PlayerHomeState extends State<PlayerHome> {
       (track) => track.path == _queueTracks[next].path,
     );
     if (libraryIndex < 0) return;
-    await _playTrack(libraryIndex, queue: _queueTracks);
+    await _playTrack(
+      libraryIndex,
+      queue: _queueTracks,
+      playlistId: _playingPlaylistId,
+    );
   }
 
   Future<void> _editTrack(Track track) async {
@@ -935,6 +1026,7 @@ class _PlayerHomeState extends State<PlayerHome> {
     Navigator.of(context).push<void>(
       MaterialPageRoute(
         builder: (context) => _NowPlayingScreen(
+          title: _nowPlayingLabel,
           player: _player,
           queueTracks: _queueTracks,
           initialQueueIndex: queueIndex,
@@ -961,6 +1053,206 @@ class _PlayerHomeState extends State<PlayerHome> {
         ),
       ),
     );
+  }
+
+  static const _iCloudUnavailableMessage =
+      'iCloud Drive is unavailable. Check that you are signed in to iCloud and that iCloud Drive is on.';
+
+  Future<void> _relinkLibraryFolder() async {
+    if (await _libraryRepository.loadStorageMode() ==
+        LibraryRepository.storageModeICloud) {
+      final icloudPath = await LibraryFolderChannel.iCloudDocuments();
+      if (icloudPath == null) {
+        _showMessage(_iCloudUnavailableMessage);
+        return;
+      }
+      await _libraryRepository.setExternalDirectory(icloudPath);
+      return;
+    }
+    final storedPath = await _libraryRepository.loadExternalDirectory();
+    if (storedPath == null) return;
+    final restoredPath = await LibraryFolderChannel.restoreFolder();
+    if (restoredPath == null) {
+      _showMessage(
+        'Your Aether library folder is unavailable. Check that it still exists on this device.',
+      );
+      return;
+    }
+    if (restoredPath != storedPath) {
+      await _libraryRepository.setExternalDirectory(restoredPath);
+    }
+  }
+
+  /// Runs once on iOS, when no storage choice has been made and no library
+  /// folder is set yet.
+  Future<void> _offerIosStorageChoiceIfNeeded() async {
+    final mode = await _libraryRepository.loadStorageMode();
+    final externalPath = await _libraryRepository.loadExternalDirectory();
+    if (mode != null || externalPath != null || !mounted) return;
+    // iCloud is only offered when the app has the iCloud entitlement
+    // (paid developer signing). Otherwise the choice would loop every launch.
+    final icloudAvailable =
+        await LibraryFolderChannel.iCloudDocuments() != null;
+    if (!mounted) return;
+    final choice = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Where should Aether keep your library?'),
+        content: Text(
+          icloudAvailable
+              ? 'On this iPhone keeps your music on this device only. iCloud Drive keeps your library in your Apple ID, so it can be restored after a reinstall.'
+              : 'On this iPhone keeps your music on this device only. Files / Google Drive stores your library in a folder you choose, so it can be restored after a reinstall.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(
+              dialogContext,
+              LibraryRepository.storageModeLocal,
+            ),
+            child: const Text('On this iPhone'),
+          ),
+          if (!icloudAvailable)
+            FilledButton(
+              onPressed: () =>
+                  Navigator.pop(dialogContext, _filesStorageChoice),
+              child: const Text('Files / Google Drive'),
+            ),
+          if (icloudAvailable)
+            FilledButton(
+              onPressed: () => Navigator.pop(
+                dialogContext,
+                LibraryRepository.storageModeICloud,
+              ),
+              child: const Text('iCloud'),
+            ),
+        ],
+      ),
+    );
+    if (!mounted || choice == null) return;
+    if (choice == LibraryRepository.storageModeLocal) {
+      await _libraryRepository.setStorageMode(choice);
+      return;
+    }
+    if (choice == _filesStorageChoice) {
+      await _chooseLibraryFolder();
+      return;
+    }
+    await _chooseICloudStorage();
+  }
+
+  static const _filesStorageChoice = 'files';
+
+  Future<void> _chooseICloudStorage() async {
+    try {
+      final icloudPath = await LibraryFolderChannel.iCloudDocuments();
+      if (icloudPath == null) {
+        _showMessage(_iCloudUnavailableMessage);
+        return;
+      }
+      final hasLibrary = await File(
+        p.join(icloudPath, 'aether_state.json'),
+      ).exists();
+      if (!mounted) return;
+      final isNewSetup = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => AlertDialog(
+          title: const Text('iCloud storage'),
+          content: const Text(
+            'Are you new to Aether, or do you want to import the library already saved in iCloud?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Import'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('I am new'),
+            ),
+          ],
+        ),
+      );
+      if (!mounted || isNewSetup == null) return;
+      if (isNewSetup && hasLibrary) {
+        _showMessage(
+          'An Aether library already exists in iCloud. Choose Import to use it.',
+        );
+        return;
+      }
+      if (!isNewSetup && !hasLibrary) {
+        _showMessage(
+          'No Aether library was found in iCloud. Choose "I am new" instead.',
+        );
+        return;
+      }
+      await _applyLibraryFolder(icloudPath, restoring: !isNewSetup);
+      await _libraryRepository.setStorageMode(
+        LibraryRepository.storageModeICloud,
+      );
+    } catch (error) {
+      _showMessage('Could not use iCloud storage: $error');
+    }
+  }
+
+  Future<void> _chooseLibraryFolder() async {
+    try {
+      final path = Platform.isIOS
+          ? await LibraryFolderChannel.pickFolder()
+          : await FilePicker.getDirectoryPath(
+              dialogTitle: 'Choose Aether library folder',
+            );
+      if (path == null || !mounted) return;
+      final stateFile = File(p.join(path, 'aether_state.json'));
+      final restoring = _tracks.isEmpty && await stateFile.exists();
+      await _applyLibraryFolder(path, restoring: restoring);
+      if (Platform.isIOS) {
+        await _libraryRepository.setStorageMode(
+          LibraryRepository.storageModeLocal,
+        );
+      }
+      _showMessage(
+        restoring
+            ? 'Aether library restored from the selected folder. Restart Aether to apply restored settings.'
+            : 'Aether library moved to the selected folder.',
+      );
+    } catch (error) {
+      _showMessage('Could not use that folder: $error');
+    }
+  }
+
+  Future<void> _applyLibraryFolder(
+    String path, {
+    required bool restoring,
+  }) async {
+    if (restoring) {
+      await _libraryRepository.restoreFromExternalDirectory(path);
+    } else {
+      await _libraryRepository.migrateToExternalDirectory(path);
+    }
+    final tracks = await _libraryRepository.loadTracks();
+    final likedPaths = await _libraryRepository.loadLikedPaths();
+    final playlists = await _libraryRepository.loadPlaylists();
+    if (!mounted) return;
+    // The native player still holds the old sources; drop them so the next
+    // play rebuilds the queue from the new list instead of mismatching indexes.
+    await _player.stop();
+    _queueLoaded = false;
+    setState(() {
+      _tracks
+        ..clear()
+        ..addAll(tracks);
+      _queueTracks
+        ..clear()
+        ..addAll(tracks);
+      _likedTracks
+        ..clear()
+        ..addAll(likedPaths);
+      _playlists
+        ..clear()
+        ..addAll(playlists);
+    });
   }
 
   void _selectSection(int index) {
@@ -1556,28 +1848,31 @@ class _PlayerHomeState extends State<PlayerHome> {
     return ListView(
       padding: EdgeInsets.fromLTRB(isWide ? 36 : 20, 16, isWide ? 36 : 20, 24),
       children: [
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        Text('Playlists', style: Theme.of(context).textTheme.headlineMedium),
+        const SizedBox(height: 6),
+        Text(
+          'Made from your own music.',
+          style: Theme.of(
+            context,
+          ).textTheme.bodyLarge?.copyWith(color: colorScheme.onSurfaceVariant),
+        ),
+        const SizedBox(height: 16),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
           children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'Playlists',
-                    style: Theme.of(context).textTheme.headlineMedium,
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    'Made from your own music.',
-                    style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                      color: colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                ],
+            if (widget.youTubeSearchEnabled)
+              OutlinedButton.icon(
+                onPressed: _spotifySyncing ? null : _importSpotifyPlaylist,
+                icon: const Icon(Icons.download_rounded),
+                label: const Text('Spotify'),
               ),
-            ),
-            const SizedBox(width: 12),
+            if (widget.youTubeSearchEnabled)
+              OutlinedButton.icon(
+                onPressed: _spotifySyncing ? null : _importYouTubePlaylist,
+                icon: const Icon(Icons.download_rounded),
+                label: const Text('YouTube'),
+              ),
             FilledButton.icon(
               onPressed: _tracks.isEmpty ? null : () => _editPlaylist(),
               icon: const Icon(Icons.add_rounded),
@@ -1699,6 +1994,15 @@ class _PlayerHomeState extends State<PlayerHome> {
                           icon: const Icon(Icons.play_arrow_rounded),
                           label: const Text('Play'),
                         ),
+                        if (widget.youTubeSearchEnabled &&
+                            playlist.spotifyFolderPath != null)
+                          FilledButton.tonalIcon(
+                            onPressed: _spotifySyncing
+                                ? null
+                                : () => _resyncSpotifyPlaylist(playlist),
+                            icon: const Icon(Icons.sync_rounded),
+                            label: const Text('Re-sync'),
+                          ),
                         IconButton(
                           tooltip: 'Edit playlist',
                           onPressed: () => _editPlaylist(playlist),
@@ -1733,6 +2037,7 @@ class _PlayerHomeState extends State<PlayerHome> {
               _tracks.indexOf(track),
               isWide,
               queue: playlistTracks,
+              playlistId: playlist.id,
             ),
       ],
     );
@@ -1805,6 +2110,7 @@ class _PlayerHomeState extends State<PlayerHome> {
     await _playTrack(
       _tracks.indexOf(playlistTracks.first),
       queue: playlistTracks,
+      playlistId: playlist.id,
     );
   }
 
@@ -1835,6 +2141,7 @@ class _PlayerHomeState extends State<PlayerHome> {
         name: draft.name,
         coverPath: coverPath,
         trackPaths: draft.trackPaths,
+        spotifyFolderPath: existing?.spotifyFolderPath,
       );
       final savedPlaylists = [..._playlists];
       final existingIndex = savedPlaylists.indexWhere(
@@ -1856,6 +2163,429 @@ class _PlayerHomeState extends State<PlayerHome> {
       });
     } catch (error) {
       _showMessage('Could not save playlist: $error');
+    }
+  }
+
+  Future<T> _runSpotifyBusy<T>(
+    String initialStatus,
+    Future<T> Function(ValueNotifier<String> status) work,
+  ) async {
+    final status = ValueNotifier<String>(initialStatus);
+    showSpotifyBusyDialog(context, status);
+    try {
+      return await work(status);
+    } finally {
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+    }
+  }
+
+  String _describeSpotifyError(Object error) => error is SpotifyServiceException
+      ? error.message
+      : 'Could not read the Spotify playlist: $error';
+
+  Future<void> _addLibraryTracks(List<Track> tracks) async {
+    if (tracks.isEmpty) return;
+    await _addToQueue(tracks);
+    if (!mounted) return;
+    setState(() => _tracks.addAll(tracks));
+  }
+
+  Future<Directory> _uniqueSpotifyFolder(Directory root, String name) async {
+    final base = sanitizeFolderName(name);
+    var candidate = Directory(p.join(root.path, base));
+    var suffix = 2;
+    while (await candidate.exists()) {
+      candidate = Directory(p.join(root.path, '$base ($suffix)'));
+      suffix++;
+    }
+    return candidate;
+  }
+
+  Future<void> _importSpotifyPlaylist() async {
+    if (_spotifySyncing) return;
+    final link = await showSpotifyLinkDialog(context);
+    if (link == null || !mounted) return;
+    final id = SpotifyService.playlistIdFromInput(link);
+    if (id == null) {
+      _showMessage('That does not look like a Spotify playlist link.');
+      return;
+    }
+
+    SpotifyPlaylist? remote;
+    try {
+      remote = await _runSpotifyBusy(
+        'Reading the Spotify playlist…',
+        (_) => _spotifyService.fetchPlaylist(id),
+      );
+    } catch (error) {
+      _showMessage(_describeSpotifyError(error));
+      return;
+    }
+    if (remote == null || !mounted) return;
+
+    final root = await _libraryRepository.spotifyRootDirectory();
+    final existingFolder = await findFolderForSpotifyId(root, remote.id);
+    if (!mounted) return;
+    final choice = await showSpotifyFolderDialog(
+      context,
+      suggestedName: remote.name,
+      existingFolderName: existingFolder == null
+          ? null
+          : p.basename(existingFolder.path),
+    );
+    if (choice == null || !mounted) return;
+
+    final folder = choice.reconnect && existingFolder != null
+        ? existingFolder
+        : await _uniqueSpotifyFolder(root, choice.folderName);
+    await _syncSpotifyPlaylist(remote, folder);
+  }
+
+  Future<void> _importYouTubePlaylist() async {
+    if (_spotifySyncing) return;
+    final link = await showYouTubeLinkDialog(context);
+    if (link == null || !mounted) return;
+    final id = YouTubeService.playlistIdFromInput(link);
+    if (id == null) {
+      _showMessage('That does not look like a YouTube playlist link.');
+      return;
+    }
+
+    YouTubePlaylistImport? remote;
+    try {
+      remote = await _fetchYouTubePlaylistImport(
+        id,
+        'Reading the YouTube playlist…',
+      );
+    } catch (error) {
+      _showMessage(describeYouTubeError(error, 'read the YouTube playlist'));
+      return;
+    }
+    if (remote == null || !mounted) return;
+
+    final root = await _libraryRepository.youTubeRootDirectory();
+    final existingFolder = await findFolderForSpotifyId(
+      root,
+      remote.playlist.id,
+    );
+    if (!mounted) return;
+    final choice = await showSpotifyFolderDialog(
+      context,
+      suggestedName: remote.playlist.name,
+      existingFolderName: existingFolder == null
+          ? null
+          : p.basename(existingFolder.path),
+      rootFolderLabel: 'YouTube',
+    );
+    if (choice == null || !mounted) return;
+
+    final folder = choice.reconnect && existingFolder != null
+        ? existingFolder
+        : await _uniqueSpotifyFolder(root, choice.folderName);
+    await _syncSpotifyPlaylist(
+      remote.playlist,
+      folder,
+      knownMatches: remote.matches,
+      notice: _youTubeTruncatedNotice(remote),
+    );
+  }
+
+  Future<YouTubePlaylistImport?> _fetchYouTubePlaylistImport(
+    String id,
+    String status,
+  ) => _runSpotifyBusy(
+    status,
+    (_) async => YouTubePlaylistImport(await _youTubeService.fetchPlaylist(id)),
+  );
+
+  String? _youTubeTruncatedNotice(YouTubePlaylistImport remote) =>
+      remote.truncated
+      ? 'Only the first ${remote.playlist.tracks.length} videos of this playlist were loaded.'
+      : null;
+
+  Future<void> _resyncSpotifyPlaylist(Playlist playlist) async {
+    final folderPath = playlist.spotifyFolderPath;
+    if (folderPath == null || _spotifySyncing) return;
+    final folder = Directory(folderPath);
+    final manifest = await SpotifyFolderManifest.read(folder);
+    if (manifest == null) {
+      _showMessage('This folder has no saved playlist link to re-sync.');
+      return;
+    }
+
+    if (isYouTubePlaylistId(manifest.spotifyId)) {
+      YouTubePlaylistImport? remote;
+      try {
+        remote = await _fetchYouTubePlaylistImport(
+          manifest.spotifyId.substring(youTubeIdPrefix.length),
+          'Checking the YouTube playlist…',
+        );
+      } catch (error) {
+        _showMessage(describeYouTubeError(error, 'read the YouTube playlist'));
+        return;
+      }
+      if (remote == null || !mounted) return;
+      await _syncSpotifyPlaylist(
+        remote.playlist,
+        folder,
+        existing: playlist,
+        knownMatches: remote.matches,
+        notice: _youTubeTruncatedNotice(remote),
+      );
+      return;
+    }
+
+    SpotifyPlaylist? remote;
+    try {
+      remote = await _runSpotifyBusy(
+        'Checking the Spotify playlist…',
+        (_) => _spotifyService.fetchPlaylist(manifest.spotifyId),
+      );
+    } catch (error) {
+      _showMessage(_describeSpotifyError(error));
+      return;
+    }
+    if (remote == null || !mounted) return;
+    await _syncSpotifyPlaylist(remote, folder, existing: playlist);
+  }
+
+  /// Brings [folder] in line with [remote]: keeps songs already on disk,
+  /// matches and downloads the new ones after the user reviews them, and
+  /// saves the playlist that points at the folder.
+  Future<void> _syncSpotifyPlaylist(
+    SpotifyPlaylist remote,
+    Directory folder, {
+    Playlist? existing,
+    Map<String, YouTubeSearchResult> knownMatches = const {},
+    String? notice,
+  }) async {
+    if (_spotifySyncing) return;
+    setState(() => _spotifySyncing = true);
+    try {
+      await folder.create(recursive: true);
+      final previous = await SpotifyFolderManifest.read(folder);
+      final previousFiles = <String, String>{
+        for (final track in previous?.tracks ?? const <SpotifyFolderTrack>[])
+          if (track.fileName != null) track.uri: track.fileName!,
+      };
+
+      final entries = <SpotifyFolderTrack>[];
+      for (final track in remote.tracks) {
+        var fileName = previousFiles[track.uri];
+        if (fileName != null &&
+            !await File(p.join(folder.path, fileName)).exists()) {
+          fileName = null;
+        }
+        entries.add(SpotifyFolderTrack.fromSpotify(track, fileName: fileName));
+      }
+      final entryIndexByUri = {
+        for (var i = 0; i < entries.length; i++) entries[i].uri: i,
+      };
+
+      SpotifyFolderManifest manifestFor(List<SpotifyFolderTrack> tracks) =>
+          SpotifyFolderManifest(
+            spotifyId: remote.id,
+            url: remote.url,
+            name: remote.name,
+            syncedAt: DateTime.now(),
+            tracks: tracks,
+          );
+
+      final coverFile = File(
+        p.join(folder.path, SpotifyFolderManifest.coverFileName),
+      );
+      final coverUrl = remote.coverUrl;
+      if (coverUrl != null) {
+        final bytes = await _spotifyService.fetchCover(coverUrl);
+        if (bytes != null) await coverFile.writeAsBytes(bytes);
+      }
+      await manifestFor(entries).write(folder);
+
+      final onDisk = <Track>[];
+      for (final entry in entries) {
+        final fileName = entry.fileName;
+        if (fileName == null) continue;
+        final path = p.join(folder.path, fileName);
+        if (_tracks.any((track) => track.path == path)) continue;
+        onDisk.add(
+          await _libraryRepository.registerTrackInPlace(
+            filePath: path,
+            title: entry.title,
+            artist: entry.artist,
+            album: '',
+            duration: entry.durationMs == null
+                ? null
+                : Duration(milliseconds: entry.durationMs!),
+          ),
+        );
+      }
+      await _addLibraryTracks(onDisk);
+
+      final pendingIndexes = [
+        for (var i = 0; i < entries.length; i++)
+          if (entries[i].fileName == null) i,
+      ];
+      var matches = <SpotifyTrackMatch>[];
+      String? matchError;
+      final needsSearch = pendingIndexes.any(
+        (i) => !knownMatches.containsKey(remote.tracks[i].uri),
+      );
+      if (pendingIndexes.isNotEmpty && !needsSearch) {
+        matches = [
+          for (final i in pendingIndexes)
+            SpotifyTrackMatch(
+              track: remote.tracks[i],
+              result: knownMatches[remote.tracks[i].uri],
+            ),
+        ];
+      } else if (pendingIndexes.isNotEmpty) {
+        matches = await _runSpotifyBusy('Matching songs on YouTube…', (
+          status,
+        ) async {
+          final results = <SpotifyTrackMatch>[];
+          for (var n = 0; n < pendingIndexes.length; n++) {
+            final track = remote.tracks[pendingIndexes[n]];
+            final known = knownMatches[track.uri];
+            if (known != null) {
+              results.add(SpotifyTrackMatch(track: track, result: known));
+              continue;
+            }
+            status.value =
+                'Matching ${n + 1} of ${pendingIndexes.length}: ${track.title}';
+            try {
+              final candidates = await _youTubeService.search(
+                '${track.artist} ${track.title}',
+              );
+              results.add(
+                SpotifyTrackMatch(
+                  track: track,
+                  result: pickBestCandidate(track, candidates),
+                ),
+              );
+            } catch (error) {
+              matchError = describeYouTubeError(error, 'search YouTube');
+              break;
+            }
+          }
+          return results;
+        });
+      }
+
+      List<SpotifyTrackMatch> chosen = const [];
+      if (matches.isNotEmpty && mounted) {
+        chosen =
+            await showSpotifyReviewSheet(
+              context,
+              playlistName: remote.name,
+              matches: matches,
+              notice:
+                  notice ??
+                  (remote.mayBeTruncated
+                      ? 'Spotify only shares the first ${SpotifyService.embedTrackLimit} songs of a playlist, so this list may be incomplete.'
+                      : null),
+            ) ??
+            const [];
+      }
+      if (!mounted) return;
+
+      final toDownload = chosen.where((match) => match.matched).toList();
+      var downloaded = 0;
+      String? downloadError;
+      if (toDownload.isNotEmpty) {
+        final newTracks = <Track>[];
+        await _runSpotifyBusy('Downloading songs…', (status) async {
+          for (var n = 0; n < toDownload.length; n++) {
+            final match = toDownload[n];
+            status.value =
+                'Downloading ${n + 1} of ${toDownload.length}: ${match.track.title}';
+            try {
+              final download = await _youTubeService.download(
+                match.result!,
+                folder,
+              );
+              final index = entryIndexByUri[match.track.uri];
+              if (index != null) {
+                entries[index] = entries[index].withFileName(
+                  p.basename(download.filePath),
+                );
+              }
+              await manifestFor(entries).write(folder);
+              newTracks.add(
+                await _libraryRepository.registerTrackInPlace(
+                  filePath: download.filePath,
+                  title: match.track.title,
+                  artist: match.track.artist,
+                  album: download.album,
+                  duration: download.duration ?? match.track.duration,
+                  fallbackArtwork: download.artworkBytes,
+                ),
+              );
+              downloaded++;
+            } catch (error) {
+              downloadError = describeYouTubeError(error, 'download songs');
+              break;
+            }
+          }
+        });
+        await _addLibraryTracks(newTracks);
+      }
+      if (!mounted) return;
+
+      final folderPaths = [
+        for (final entry in entries)
+          if (entry.fileName != null) p.join(folder.path, entry.fileName!),
+      ];
+      final matchingPlaylists = _playlists.where(
+        (item) => item.spotifyFolderPath == folder.path,
+      );
+      final current =
+          existing ??
+          (matchingPlaylists.isEmpty ? null : matchingPlaylists.first);
+      final otherPaths = (current?.trackPaths ?? const <String>[]).where(
+        (path) => !p.isWithin(folder.path, path),
+      );
+      final coverPath =
+          current?.coverPath ??
+          (await coverFile.exists()
+              ? await _libraryRepository.importPlaylistCover(coverFile.path)
+              : null);
+      final playlist = Playlist(
+        id: current?.id ?? DateTime.now().microsecondsSinceEpoch.toString(),
+        name: current?.name ?? remote.name,
+        coverPath: coverPath,
+        trackPaths: [...folderPaths, ...otherPaths],
+        spotifyFolderPath: folder.path,
+      );
+      final savedPlaylists = [..._playlists];
+      final savedIndex = savedPlaylists.indexWhere(
+        (item) => item.id == playlist.id,
+      );
+      if (savedIndex < 0) {
+        savedPlaylists.add(playlist);
+      } else {
+        savedPlaylists[savedIndex] = playlist;
+      }
+      await _libraryRepository.savePlaylists(savedPlaylists);
+      if (!mounted) return;
+      setState(() {
+        _playlists
+          ..clear()
+          ..addAll(savedPlaylists);
+        _section = 3;
+        _activePlaylistId = playlist.id;
+      });
+
+      final messages = <String>[
+        '“${playlist.name}”: ${folderPaths.length} of ${remote.tracks.length} songs ready.',
+      ];
+      if (downloaded > 0) messages.add('Downloaded $downloaded.');
+      if (matchError != null) messages.add(matchError!);
+      if (downloadError != null) messages.add(downloadError!);
+      _showMessage(messages.join(' '));
+    } catch (error) {
+      _showMessage('Could not sync the playlist: $error');
+    } finally {
+      if (mounted) setState(() => _spotifySyncing = false);
     }
   }
 
@@ -1894,6 +2624,14 @@ class _PlayerHomeState extends State<PlayerHome> {
     );
   }
 
+  /// The playlist that started the current queue, or the default title.
+  String get _nowPlayingLabel {
+    for (final playlist in _playlists) {
+      if (playlist.id == _playingPlaylistId) return playlist.name;
+    }
+    return 'NOW PLAYING';
+  }
+
   Widget _buildNowPlayingFeature(Track track, bool isWide) {
     final colorScheme = Theme.of(context).colorScheme;
     final art = _buildArtwork(track, size: isWide ? 148 : 112);
@@ -1921,7 +2659,7 @@ class _PlayerHomeState extends State<PlayerHome> {
                 AnimatedSwitcher(
                   duration: const Duration(milliseconds: 220),
                   child: Text(
-                    _isPlaying ? 'NOW PLAYING' : 'IN YOUR LIBRARY',
+                    _isPlaying ? _nowPlayingLabel : 'IN YOUR LIBRARY',
                     key: ValueKey('${track.path}-$_isPlaying'),
                     style: Theme.of(context).textTheme.labelMedium?.copyWith(
                       color: _isPlaying
@@ -1983,6 +2721,7 @@ class _PlayerHomeState extends State<PlayerHome> {
     int index,
     bool isWide, {
     List<Track>? queue,
+    String? playlistId,
   }) {
     final colorScheme = Theme.of(context).colorScheme;
     final isCurrent = index == _currentTrack;
@@ -2048,7 +2787,8 @@ class _PlayerHomeState extends State<PlayerHome> {
               const SizedBox(width: 8),
               IconButton(
                 tooltip: 'Play ${track.title}',
-                onPressed: () => _playTrack(index, queue: queue),
+                onPressed: () =>
+                    _playTrack(index, queue: queue, playlistId: playlistId),
                 icon: Icon(
                   isCurrent && _isPlaying
                       ? Icons.equalizer_rounded
@@ -2057,7 +2797,7 @@ class _PlayerHomeState extends State<PlayerHome> {
               ),
             ],
           ),
-          onTap: () => _playTrack(index, queue: queue),
+          onTap: () => _playTrack(index, queue: queue, playlistId: playlistId),
           onLongPress: () => unawaited(_editTrack(track)),
         ),
       ),
@@ -2249,6 +2989,8 @@ class _PlayerHomeState extends State<PlayerHome> {
                         Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
+                            _buildShuffleButton(),
+                            _buildRepeatButton(),
                             IconButton(
                               tooltip: 'Previous track',
                               onPressed: track == null ? null : () => _skip(-1),
@@ -2377,43 +3119,70 @@ class _PlayerHomeState extends State<PlayerHome> {
     );
   }
 
-  Widget _buildProgressSlider({bool showTimestamps = false}) {
-    return StreamBuilder<Duration>(
-      stream: _player.positionStream,
-      initialData: _player.position,
+  Widget _buildShuffleButton() {
+    return StreamBuilder<bool>(
+      stream: _player.shuffleModeEnabledStream,
+      initialData: _player.shuffleModeEnabled,
       builder: (context, snapshot) {
-        final duration = _duration ?? Duration.zero;
-        final max = duration.inMilliseconds.toDouble();
-        final current = snapshot.data?.inMilliseconds ?? 0;
-        final value = max <= 0
-            ? 0.0
-            : current.clamp(0, duration.inMilliseconds).toDouble();
-        return Row(
-          children: [
-            if (showTimestamps)
-              Text(
-                _formatDuration(snapshot.data),
-                style: Theme.of(context).textTheme.labelSmall,
-              ),
-            Expanded(
-              child: Slider(
-                value: value,
-                max: max > 0 ? max : 1,
-                onChanged: max <= 0
-                    ? null
-                    : (position) => _player.seek(
-                        Duration(milliseconds: position.round()),
-                      ),
-              ),
-            ),
-            if (showTimestamps)
-              Text(
-                _formatDuration(duration),
-                style: Theme.of(context).textTheme.labelSmall,
-              ),
-          ],
+        final enabled = snapshot.data ?? _player.shuffleModeEnabled;
+        return IconButton(
+          tooltip: enabled ? 'Shuffle: On' : 'Shuffle: Off',
+          onPressed: _queueTracks.isEmpty ? null : _toggleShuffle,
+          color: enabled ? Theme.of(context).colorScheme.primary : null,
+          icon: const Icon(Icons.shuffle_rounded),
         );
       },
+    );
+  }
+
+  Widget _buildRepeatButton() {
+    return StreamBuilder<LoopMode>(
+      stream: _player.loopModeStream,
+      initialData: _player.loopMode,
+      builder: (context, snapshot) {
+        final mode = snapshot.data ?? _player.loopMode;
+        return IconButton(
+          tooltip: _repeatLabel(mode),
+          onPressed: _queueTracks.isEmpty ? null : _cycleLoopMode,
+          color: mode == LoopMode.off
+              ? null
+              : Theme.of(context).colorScheme.primary,
+          icon: Icon(
+            mode == LoopMode.one
+                ? Icons.repeat_one_rounded
+                : Icons.repeat_rounded,
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _toggleShuffle() async {
+    await _player.setShuffleModeEnabled(!_player.shuffleModeEnabled);
+  }
+
+  Future<void> _cycleLoopMode() async {
+    final nextMode = switch (_player.loopMode) {
+      LoopMode.off => _queueTracks.length > 1 ? LoopMode.all : LoopMode.one,
+      LoopMode.one => LoopMode.all,
+      LoopMode.all => LoopMode.off,
+    };
+    await _player.setLoopMode(nextMode);
+  }
+
+  String _repeatLabel(LoopMode mode) => switch (mode) {
+    LoopMode.off => 'Repeat: Off',
+    LoopMode.one => 'Repeat: Track',
+    LoopMode.all => 'Repeat: Playlist',
+  };
+
+  Widget _buildProgressSlider({bool showTimestamps = false}) {
+    return _SeekBar(
+      duration: _playing?.duration ?? _duration,
+      positionStream: _player.positionStream,
+      initialPosition: _player.position,
+      showTimestamps: showTimestamps,
+      onSeek: _player.seek,
     );
   }
 
@@ -2446,7 +3215,11 @@ class _PlayerHomeState extends State<PlayerHome> {
                     final libraryIndex = _tracks.indexWhere(
                       (track) => track.path == _queueTracks[index].path,
                     );
-                    _playTrack(libraryIndex, queue: _queueTracks);
+                    _playTrack(
+                      libraryIndex,
+                      queue: _queueTracks,
+                      playlistId: _playingPlaylistId,
+                    );
                     Navigator.pop(context);
                   },
                 ),
@@ -2575,7 +3348,7 @@ class AboutScreen extends StatelessWidget {
                   contentPadding: EdgeInsets.zero,
                   leading: Icon(Icons.new_releases_outlined),
                   title: Text('Version'),
-                  subtitle: Text('1.1.0-abf'),
+                  subtitle: Text('1.2.0-abf'),
                 ),
                 ListTile(
                   contentPadding: EdgeInsets.zero,
@@ -2594,8 +3367,8 @@ class AboutScreen extends StatelessWidget {
                   secondary: const Icon(Icons.smart_display_outlined),
                   title: const Text('Experimental'),
                   subtitle: const Text(
-                    'Search YouTube, prepare songs for playback, and save '
-                    'them to your library. Off by default.',
+                    'Search YouTube, import Spotify playlists, prepare songs '
+                    'for playback, and save them to your library. Off by default.',
                   ),
                 ),
                 if (youTubeSearchEnabled) ...[
@@ -2859,8 +3632,7 @@ class _WindowButton extends StatelessWidget {
                   : Colors.transparent,
             ),
             foregroundColor: WidgetStateProperty.resolveWith(
-              (states) =>
-                  danger && states.contains(WidgetState.hovered)
+              (states) => danger && states.contains(WidgetState.hovered)
                   ? colorScheme.onError
                   : colorScheme.onSurfaceVariant,
             ),
@@ -2894,6 +3666,7 @@ class _AboutSectionLabel extends StatelessWidget {
 
 class _NowPlayingScreen extends StatelessWidget {
   const _NowPlayingScreen({
+    required this.title,
     required this.player,
     required this.queueTracks,
     required this.initialQueueIndex,
@@ -2906,6 +3679,7 @@ class _NowPlayingScreen extends StatelessWidget {
     required this.onEditTrack,
   });
 
+  final String title;
   final AudioPlayer player;
   final List<Track> queueTracks;
   final int initialQueueIndex;
@@ -2939,7 +3713,9 @@ class _NowPlayingScreen extends StatelessWidget {
               icon: const Icon(Icons.keyboard_arrow_down_rounded),
             ),
             title: Text(
-              'NOW PLAYING',
+              title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style: Theme.of(context).textTheme.labelLarge?.copyWith(
                 fontWeight: FontWeight.w700,
                 letterSpacing: 0,
@@ -3124,6 +3900,8 @@ class _NowPlayingScreen extends StatelessWidget {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
+        _buildShuffleButton(),
+        const SizedBox(width: 8),
         IconButton.filledTonal(
           tooltip: 'Previous track',
           onPressed: canSkip ? () => onSkip(-1) : null,
@@ -3139,50 +3917,153 @@ class _NowPlayingScreen extends StatelessWidget {
           icon: const Icon(Icons.skip_next_rounded),
           iconSize: 30,
         ),
+        const SizedBox(width: 8),
+        _buildRepeatButton(),
       ],
     );
   }
 
   Widget _buildTimeline(BuildContext context, Track track) {
-    return StreamBuilder<Duration>(
-      stream: player.positionStream,
-      initialData: player.position,
-      builder: (context, positionSnapshot) {
-        return StreamBuilder<Duration?>(
-          stream: player.durationStream,
-          initialData: player.duration ?? track.duration,
-          builder: (context, durationSnapshot) {
-            final duration =
-                durationSnapshot.data ?? track.duration ?? Duration.zero;
-            final max = duration.inMilliseconds.toDouble();
-            final current = positionSnapshot.data?.inMilliseconds ?? 0;
-            final value = max <= 0
-                ? 0.0
-                : current.clamp(0, duration.inMilliseconds).toDouble();
-            return Row(
-              children: [
-                Text(
-                  _formatDuration(positionSnapshot.data),
-                  style: Theme.of(context).textTheme.labelMedium,
-                ),
-                Expanded(
-                  child: Slider(
-                    value: value,
-                    max: max > 0 ? max : 1,
-                    onChanged: max <= 0
-                        ? null
-                        : (position) => player.seek(
-                            Duration(milliseconds: position.round()),
-                          ),
-                  ),
-                ),
-                Text(
-                  _formatDuration(duration),
-                  style: Theme.of(context).textTheme.labelMedium,
-                ),
-              ],
-            );
+    return _SeekBar(
+      duration: track.duration ?? player.duration,
+      positionStream: player.positionStream,
+      initialPosition: player.position,
+      showTimestamps: true,
+      onSeek: player.seek,
+    );
+  }
+
+  Widget _buildShuffleButton() {
+    return StreamBuilder<bool>(
+      stream: player.shuffleModeEnabledStream,
+      initialData: player.shuffleModeEnabled,
+      builder: (context, snapshot) {
+        final enabled = snapshot.data ?? player.shuffleModeEnabled;
+        return IconButton(
+          tooltip: enabled ? 'Shuffle: On' : 'Shuffle: Off',
+          onPressed: queueTracks.isEmpty
+              ? null
+              : () => player.setShuffleModeEnabled(!player.shuffleModeEnabled),
+          color: enabled ? Theme.of(context).colorScheme.primary : null,
+          icon: const Icon(Icons.shuffle_rounded),
+        );
+      },
+    );
+  }
+
+  Widget _buildRepeatButton() {
+    return StreamBuilder<LoopMode>(
+      stream: player.loopModeStream,
+      initialData: player.loopMode,
+      builder: (context, snapshot) {
+        final mode = snapshot.data ?? player.loopMode;
+        return IconButton(
+          tooltip: switch (mode) {
+            LoopMode.off => 'Repeat: Off',
+            LoopMode.one => 'Repeat: Track',
+            LoopMode.all => 'Repeat: Playlist',
           },
+          onPressed: queueTracks.isEmpty
+              ? null
+              : () {
+                  final nextMode = switch (player.loopMode) {
+                    LoopMode.off =>
+                      queueTracks.length > 1 ? LoopMode.all : LoopMode.one,
+                    LoopMode.one => LoopMode.all,
+                    LoopMode.all => LoopMode.off,
+                  };
+                  player.setLoopMode(nextMode);
+                },
+          color: mode == LoopMode.off
+              ? null
+              : Theme.of(context).colorScheme.primary,
+          icon: Icon(
+            mode == LoopMode.one
+                ? Icons.repeat_one_rounded
+                : Icons.repeat_rounded,
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _SeekBar extends StatefulWidget {
+  const _SeekBar({
+    required this.duration,
+    required this.positionStream,
+    required this.initialPosition,
+    required this.onSeek,
+    this.showTimestamps = false,
+  });
+
+  final Duration? duration;
+  final Stream<Duration> positionStream;
+  final Duration initialPosition;
+  final bool showTimestamps;
+  final Future<void> Function(Duration) onSeek;
+
+  @override
+  State<_SeekBar> createState() => _SeekBarState();
+}
+
+class _SeekBarState extends State<_SeekBar> {
+  Duration? _dragPosition;
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<Duration>(
+      stream: widget.positionStream,
+      initialData: widget.initialPosition,
+      builder: (context, snapshot) {
+        final duration = widget.duration ?? Duration.zero;
+        final max = duration.inMilliseconds.toDouble();
+        final position = _dragPosition ?? snapshot.data ?? Duration.zero;
+        final current = max <= 0
+            ? 0.0
+            : position.inMilliseconds
+                  .clamp(0, duration.inMilliseconds)
+                  .toDouble();
+        return Row(
+          children: [
+            if (widget.showTimestamps)
+              Text(
+                _formatDuration(Duration(milliseconds: current.round())),
+                style: Theme.of(context).textTheme.labelMedium,
+              ),
+            Expanded(
+              child: Slider(
+                value: current,
+                max: max > 0 ? max : 1,
+                onChangeStart: max <= 0
+                    ? null
+                    : (value) => setState(
+                        () => _dragPosition = Duration(
+                          milliseconds: value.round(),
+                        ),
+                      ),
+                onChanged: max <= 0
+                    ? null
+                    : (value) => setState(
+                        () => _dragPosition = Duration(
+                          milliseconds: value.round(),
+                        ),
+                      ),
+                onChangeEnd: max <= 0
+                    ? null
+                    : (value) async {
+                        final target = Duration(milliseconds: value.round());
+                        await widget.onSeek(target);
+                        if (mounted) setState(() => _dragPosition = null);
+                      },
+              ),
+            ),
+            if (widget.showTimestamps)
+              Text(
+                _formatDuration(duration),
+                style: Theme.of(context).textTheme.labelMedium,
+              ),
+          ],
         );
       },
     );
@@ -3268,7 +4149,8 @@ class _TrackEditorSheetState extends State<_TrackEditorSheet> {
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
-    final hasCover = _coverSourcePath != null || widget.track.artworkBytes != null;
+    final hasCover =
+        _coverSourcePath != null || widget.track.artworkBytes != null;
     return Padding(
       padding: EdgeInsets.fromLTRB(
         24,
@@ -3281,10 +4163,7 @@ class _TrackEditorSheetState extends State<_TrackEditorSheet> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              'Edit song',
-              style: Theme.of(context).textTheme.headlineSmall,
-            ),
+            Text('Edit song', style: Theme.of(context).textTheme.headlineSmall),
             const SizedBox(height: 18),
             Row(
               children: [
@@ -3329,7 +4208,9 @@ class _TrackEditorSheetState extends State<_TrackEditorSheet> {
             SizedBox(
               width: double.infinity,
               child: FilledButton.icon(
-                onPressed: _titleController.text.trim().isEmpty ? null : _submit,
+                onPressed: _titleController.text.trim().isEmpty
+                    ? null
+                    : _submit,
                 icon: const Icon(Icons.check_rounded),
                 label: const Text('Save changes'),
               ),
